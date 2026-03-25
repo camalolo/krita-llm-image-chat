@@ -745,7 +745,11 @@ def handle_save_document(args):
     info = InfoObject()
     if export_format == "jpeg":
         info.setProperty("quality", 90)
-    export_ok = doc.exportImage(export_path, info)
+    doc.setBatchmode(True)
+    try:
+        export_ok = doc.exportImage(export_path, info)
+    finally:
+        doc.setBatchmode(False)
     if not export_ok:
         return {"success": False, "error": f"Saved .kra to '{kra_path}' but failed to export to '{export_path}'"}
 
@@ -762,72 +766,70 @@ def handle_split_export_regions(args):
     current_path = doc.fileName() and os.path.normpath(doc.fileName()) or ""
     results = []
     
-    for i, region in enumerate(regions):
-        x = region.get("x")
-        y = region.get("y")
-        w = region.get("w")
-        h = region.get("h")
-        path = region.get("path")
-        
-        if x is None or y is None or w is None or h is None or not path:
-            results.append({"index": i, "success": False, "error": "Missing required field(s): x, y, w, h, path"})
-            continue
-        
-        # Infer format from extension (before collision check so we compare the final path)
-        _, ext = os.path.splitext(path)
-        if not ext:
-            path = f"{path}.png"
-            ext = ".png"
-        file_format = ext.lstrip('.').lower()
-        if file_format == "jpg":
-            file_format = "jpeg"
-        
-        # Safety: cannot overwrite the currently open document
-        if current_path and os.path.normpath(path) == current_path:
-            results.append({"index": i, "success": False, "path": path, "error": "Cannot overwrite the currently open document"})
-            continue
-        
-        # Step 1: Create selection
-        selection = Selection()
-        selection.select(int(x), int(y), int(w), int(h), 255)
-        doc.setSelection(selection)
-        
-        # Step 2: Crop to selection
-        crop_action = Krita.instance().action("resizeimagetoselection")
-        if not crop_action:
-            doc.setSelection(None)
-            results.append({"index": i, "success": False, "error": "Trim-to-selection action not available"})
-            continue
-        crop_action.trigger()
-        doc.refreshProjection()
-        
-        # Step 3: Export
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        info = InfoObject()
-        if file_format == "jpeg":
-            info.setProperty("quality", 90)
-        try:
-            export_ok = doc.exportImage(path, info)
-        except Exception as e:
+    doc.setBatchmode(True)
+    try:
+        for i, region in enumerate(regions):
+            x = region.get("x")
+            y = region.get("y")
+            w = region.get("w")
+            h = region.get("h")
+            path = region.get("path")
+            
+            if x is None or y is None or w is None or h is None or not path:
+                results.append({"index": i, "success": False, "error": "Missing required field(s): x, y, w, h, path"})
+                continue
+            
+            # Infer format from extension (before collision check so we compare the final path)
+            _, ext = os.path.splitext(path)
+            if not ext:
+                path = f"{path}.png"
+                ext = ".png"
+            file_format = ext.lstrip('.').lower()
+            if file_format == "jpg":
+                file_format = "jpeg"
+            
+            # Safety: cannot overwrite the currently open document
+            if current_path and os.path.normpath(path) == current_path:
+                results.append({"index": i, "success": False, "path": path, "error": "Cannot overwrite the currently open document"})
+                continue
+            
             export_ok = False
-            logger.error(f"Exception during export of region {i} to '{path}': {e}")
-        
-        # Step 4: Undo to restore original document (ALWAYS undo, even if export failed)
-        undo_action = Krita.instance().action("edit_undo")
-        if undo_action and undo_action.isEnabled():
-            undo_action.trigger()
-            doc.refreshProjection()
-        else:
-            logger.warning(f"Could not undo after region {i} export — document may be left in cropped state")
-        
-        # Step 5: Clear selection
-        doc.setSelection(None)
-        
-        if export_ok:
-            results.append({"index": i, "success": True, "path": path})
-            logger.info(f"Exported region {i} to '{path}'")
-        else:
-            results.append({"index": i, "success": False, "path": path, "error": f"Export to '{path}' failed"})
+            selection = Selection()
+            selection.select(int(x), int(y), int(w), int(h), 255)
+            doc.setSelection(selection)
+            try:
+                crop_action = Krita.instance().action("resizeimagetoselection")
+                if not crop_action:
+                    results.append({"index": i, "success": False, "error": "Trim-to-selection action not available"})
+                    continue
+                crop_action.trigger()
+                doc.refreshProjection()
+                
+                os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+                info = InfoObject()
+                if file_format == "jpeg":
+                    info.setProperty("quality", 90)
+                try:
+                    export_ok = doc.exportImage(path, info)
+                except Exception as e:
+                    export_ok = False
+                    logger.error(f"Exception during export of region {i} to '{path}': {e}")
+            finally:
+                undo_action = Krita.instance().action("edit_undo")
+                if undo_action and undo_action.isEnabled():
+                    undo_action.trigger()
+                    doc.refreshProjection()
+                else:
+                    logger.warning(f"Could not undo after region {i} — document may be left in cropped state")
+                doc.setSelection(None)
+            
+            if export_ok:
+                results.append({"index": i, "success": True, "path": path})
+                logger.info(f"Exported region {i} to '{path}'")
+            else:
+                results.append({"index": i, "success": False, "path": path, "error": f"Export to '{path}' failed"})
+    finally:
+        doc.setBatchmode(False)
     
     success_count = sum(1 for r in results if r.get("success"))
     fail_count = len(results) - success_count
@@ -857,7 +859,11 @@ def handle_export_image(args):
     info = InfoObject()
     if file_format == "jpeg":
         info.setProperty("quality", 90)
-    success = doc.exportImage(path, info)
+    doc.setBatchmode(True)
+    try:
+        success = doc.exportImage(path, info)
+    finally:
+        doc.setBatchmode(False)
     if success:
         return {"success": True, "message": f"Exported document to '{path}'"}
     return {"success": False, "error": f"Failed to export to '{path}'. Check that the file format is supported and the path is writable."}
