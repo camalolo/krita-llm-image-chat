@@ -1,21 +1,7 @@
 from krita import Krita, Selection, InfoObject, ManagedColor
+from .config import logger, log_exception
 import json
-import logging
-import traceback
-
-LOG_PATH = "C:/Users/camal/AppData/Roaming/krita/pykrita/llm_image_chat/llm_image_chat.log"
-
-logging.basicConfig(
-    filename=LOG_PATH,
-    level=logging.DEBUG,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
-
-def log_exception(e, context=""):
-    logger.error(f"EXCEPTION in {context}: {type(e).__name__}: {str(e)}")
-    logger.debug(traceback.format_exc())
+import os
 
 BLEND_MODES = ["normal", "multiply", "screen", "overlay", "darken",
                "lighten", "color-dodge", "color-burn", "hard-light",
@@ -134,15 +120,34 @@ def handle_apply_filter(args):
         config = filter_obj.configuration()
         if config:
             logger.debug(f"Filter has configuration, properties: {[p.name for p in config.properties()]}")
+            set_any = False
             for prop in config.properties():
                 prop_name = prop.name.lower()
                 if any(x in prop_name for x in ["radius", "strength", "intensity", "amount", "level"]):
-                    logger.debug(f"Setting property {prop.name} to {intensity}")
+                    logger.debug(f"Found target property {prop.name}, type hint: {type(prop)}, min: {prop.min}, max: {prop.max}")
                     try:
-                        config.setProperty(prop.name, intensity)
+                        prop_min = prop.min
+                        prop_max = prop.max
+                        if prop_min is not None and prop_max is not None and prop_max > prop_min:
+                            normalized = prop_min + (intensity / 100.0) * (prop_max - prop_min)
+                        else:
+                            try:
+                                test_val = config.property(prop.name)
+                                if isinstance(test_val, float):
+                                    normalized = intensity / 100.0
+                                else:
+                                    normalized = int(intensity / 100.0 * 255)
+                            except Exception:
+                                normalized = intensity
+                        config.setProperty(prop.name, normalized)
+                        set_any = True
+                        logger.debug(f"Set property {prop.name} to {normalized} (from intensity {intensity})")
                     except Exception as e:
                         logger.warning(f"Failed to set property {prop.name}: {e}")
                     break
+            if not set_any:
+                logger.warning(f"No suitable property found on filter '{filter_name}' to set intensity")
+                return {"success": False, "error": f"Filter '{filter_name}' has no adjustable intensity property"}
             filter_obj.setConfiguration(config)
         logger.debug(f"Applying filter to layer {layer.name()}")
         filter_obj.apply(layer, 0, 0, doc.width(), doc.height())
@@ -234,21 +239,34 @@ def handle_layer_move(args):
     direction = args.get("direction", "up")
     layer = _find_layer(doc, layer_name)
     parent = layer.parentNode()
-    siblings = parent.childNodes()
+    siblings = list(parent.childNodes())
     current_index = siblings.index(layer)
-    if direction == "up" and current_index < len(siblings) - 1:
-        parent.removeChildNode(layer)
-        parent.addChildNode(layer, siblings[current_index + 1])
-    elif direction == "down" and current_index > 0:
-        parent.removeChildNode(layer)
-        parent.addChildNode(layer, siblings[current_index - 2] if current_index > 1 else None)
+    new_index = current_index
+
+    if direction == "up":
+        if current_index < len(siblings) - 1:
+            new_index = current_index + 1
+        else:
+            return {"success": True, "message": f"Layer '{layer.name()}' is already at top"}
+    elif direction == "down":
+        if current_index > 0:
+            new_index = current_index - 1
+        else:
+            return {"success": True, "message": f"Layer '{layer.name()}' is already at bottom"}
     elif direction == "top":
-        parent.removeChildNode(layer)
-        parent.addChildNode(layer, None)
+        new_index = len(siblings) - 1
     elif direction == "bottom":
-        parent.removeChildNode(layer)
-        parent.addChildNode(layer, siblings[0] if siblings else None)
+        new_index = 0
+
+    if new_index == current_index:
+        doc.refreshProjection()
+        return {"success": True, "message": f"Layer '{layer.name()}' already at requested position"}
+
+    siblings.pop(current_index)
+    siblings.insert(new_index, layer)
+    parent.setChildNodes(siblings)
     doc.refreshProjection()
+    logger.info(f"Moved layer '{layer.name()}' {direction} from index {current_index} to {new_index}")
     return {"success": True, "message": f"Moved layer '{layer.name()}' {direction}"}
 
 @register_handler("selection_create")
@@ -420,6 +438,229 @@ def handle_set_color(args):
     elif target == "background":
         view.setBackGroundColor(color)
     return {"success": True, "message": f"Set {target} color to {hex_color}"}
+
+# ─── NEW TOOL HANDLERS ────────────────────────────────────────────────────────
+
+@register_handler("selection_get_info")
+def handle_selection_get_info(args):
+    doc = _get_document()
+    selection = doc.selection()
+    if not selection:
+        return {"success": False, "error": "No selection exists"}
+    return {
+        "success": True,
+        "data": {
+            "x": selection.x(),
+            "y": selection.y(),
+            "width": selection.width(),
+            "height": selection.height()
+        }
+    }
+
+
+@register_handler("layer_copy_selection")
+def handle_layer_copy_selection(args):
+    doc = _get_document()
+    source_name = args.get("source_layer_name")
+    new_name = args.get("new_layer_name", "Copied Selection")
+    source = _find_layer(doc, source_name)
+    selection = doc.selection()
+    if not selection:
+        return {"success": False, "error": "No selection exists. Create a selection first using selection_create."}
+    x, y = selection.x(), selection.y()
+    w, h = selection.width(), selection.height()
+    pixel_data = source.pixelData(x, y, w, h)
+    new_layer = doc.createNode(new_name, "paintlayer")
+    new_layer.setPixelData(pixel_data, x, y, w, h)
+    root = doc.rootNode()
+    root.addChildNode(new_layer, source)
+    doc.setActiveNode(new_layer)
+    doc.refreshProjection()
+    return {"success": True, "message": f"Copied selection region to new layer '{new_name}'", "data": {"layer_name": new_name, "x": x, "y": y, "width": w, "height": h}}
+
+
+@register_handler("layer_set_active")
+def handle_layer_set_active(args):
+    doc = _get_document()
+    layer_name = args.get("layer_name")
+    if not layer_name:
+        return {"success": False, "error": "layer_name is required"}
+    root = doc.rootNode()
+    for node in root.childNodes():
+        if node.name() == layer_name:
+            doc.setActiveNode(node)
+            return {"success": True, "message": f"Active layer set to '{layer_name}'"}
+    return {"success": False, "error": f"Layer '{layer_name}' not found"}
+
+
+@register_handler("layer_merge_down")
+def handle_layer_merge_down(args):
+    doc = _get_document()
+    layer = doc.activeNode()
+    if not layer:
+        return {"success": False, "error": "No active layer"}
+    parent = layer.parentNode()
+    siblings = list(parent.childNodes())
+    idx = siblings.index(layer)
+    if idx == 0:
+        return {"success": False, "error": "No layer below to merge into"}
+    below = siblings[idx - 1]
+    below_name = below.name()
+    layer_name = layer.name()
+    action = Krita.instance().action("merge_down")
+    if action:
+        doc.setActiveNode(layer)
+        action.trigger()
+        doc.refreshProjection()
+        return {"success": True, "message": f"Merged '{layer_name}' down into '{below_name}'"}
+    return {"success": False, "error": "Merge down action not available"}
+
+
+@register_handler("layer_flatten")
+def handle_layer_flatten(args):
+    doc = _get_document()
+    action = Krita.instance().action("flatten_image")
+    if action:
+        action.trigger()
+        doc.refreshProjection()
+        return {"success": True, "message": "Flattened all visible layers"}
+    return {"success": False, "error": "Flatten image action not available"}
+
+
+@register_handler("layer_rename")
+def handle_layer_rename(args):
+    doc = _get_document()
+    layer_name = args.get("layer_name")
+    new_name = args.get("new_name")
+    if not layer_name or not new_name:
+        return {"success": False, "error": "Both layer_name and new_name are required"}
+    layer = _find_layer(doc, layer_name)
+    old_name = layer.name()
+    layer.setName(new_name)
+    doc.refreshProjection()
+    return {"success": True, "message": f"Renamed layer '{old_name}' to '{new_name}'"}
+
+
+@register_handler("layer_clear")
+def handle_layer_clear(args):
+    doc = _get_document()
+    layer_name = args.get("layer_name")
+    layer = _find_layer(doc, layer_name)
+    old_active = doc.activeNode()
+    doc.setActiveNode(layer)
+    action = Krita.instance().action("edit_clear")
+    if action:
+        action.trigger()
+        if old_active:
+            doc.setActiveNode(old_active)
+        doc.refreshProjection()
+        return {"success": True, "message": f"Cleared content from '{layer.name()}'"}
+    return {"success": False, "error": "Clear action not available"}
+
+
+@register_handler("layer_transform")
+def handle_layer_transform(args):
+    doc = _get_document()
+    layer_name = args.get("layer_name")
+    action_type = args.get("action")
+    layer = _find_layer(doc, layer_name)
+    if not action_type:
+        return {"success": False, "error": "action is required (flip_horizontal or flip_vertical)"}
+
+    w, h = doc.width(), doc.height()
+    pixel_data = layer.pixelData(0, 0, w, h)
+
+    depth_bytes = {"U8": 1, "U16": 2, "F16": 2, "F32": 4}
+    channel_map = {"GRAY": 1, "GRAYA": 2, "RGB": 3, "RGBA": 4, "CMYK": 4, "CMYKA": 5, "LAB": 3, "LABA": 4, "XYZ": 3, "XYZA": 4}
+    channels = channel_map.get(doc.colorModel().upper(), 4)
+    bpc = depth_bytes.get(doc.colorDepth(), 1)
+    bpp = channels * bpc
+    row_size = w * bpp
+
+    data = bytearray(pixel_data)
+
+    if action_type == "flip_horizontal":
+        for y in range(h):
+            row_start = y * row_size
+            row = data[row_start:row_start + row_size]
+            reversed_row = bytearray()
+            for x in range(w - 1, -1, -1):
+                px_start = x * bpp
+                reversed_row.extend(row[px_start:px_start + bpp])
+            data[row_start:row_start + row_size] = reversed_row
+    elif action_type == "flip_vertical":
+        for y in range(h // 2):
+            top_start = y * row_size
+            bot_start = (h - 1 - y) * row_size
+            top_row = bytearray(data[top_start:top_start + row_size])
+            bot_row = bytearray(data[bot_start:bot_start + row_size])
+            data[top_start:top_start + row_size] = bot_row
+            data[bot_start:bot_start + row_size] = top_row
+    else:
+        return {"success": False, "error": f"Unknown action: {action_type}. Supported: flip_horizontal, flip_vertical"}
+
+    layer.setPixelData(bytes(data), 0, 0, w, h)
+    doc.refreshProjection()
+    return {"success": True, "message": f"Applied {action_type} to '{layer.name()}'"}
+
+
+@register_handler("document_scale")
+def handle_document_scale(args):
+    doc = _get_document()
+    width = args.get("width", doc.width())
+    height = args.get("height", doc.height())
+    if width < 1 or height < 1:
+        return {"success": False, "error": "Width and height must be at least 1"}
+    try:
+        doc.scaleImage(width, height, doc.resolution(), doc.resolution(), "Bicubic")
+    except Exception:
+        doc.resizeImage(0, 0, width, height, doc.resolution())
+    doc.refreshProjection()
+    return {"success": True, "message": f"Scaled document to {width}x{height}"}
+
+
+@register_handler("document_new")
+def handle_document_new(args):
+    krita = Krita.instance()
+    width = args.get("width", 1920)
+    height = args.get("height", 1080)
+    name = args.get("name", "Untitled")
+    resolution = args.get("resolution", 72.0)
+    if width < 1 or height < 1:
+        return {"success": False, "error": "Width and height must be at least 1"}
+    doc = krita.createDocument(width, height, name, "RGBA", "U8", resolution)
+    if not doc:
+        return {"success": False, "error": "Failed to create new document"}
+    window = krita.activeWindow()
+    if window:
+        window.addView(doc)
+    return {"success": True, "message": f"Created new document '{name}' ({width}x{height}, {resolution} PPI)", "data": {"width": width, "height": height, "name": name}}
+
+
+@register_handler("export_image")
+def handle_export_image(args):
+    import os
+    doc = _get_document()
+    path = args.get("path")
+    file_format = args.get("format", "png")
+    if not path:
+        return {"success": False, "error": "path is required"}
+    current_path = doc.fileName()
+    if current_path and os.path.normpath(path) == os.path.normpath(current_path):
+        return {"success": False, "error": "Cannot overwrite the currently open document. Export to a different file path."}
+    if file_format == "jpg":
+        file_format = "jpeg"
+    base, ext = os.path.splitext(path)
+    if not ext:
+        path = f"{path}.{file_format}"
+    info = InfoObject()
+    if file_format in ("jpeg", "jpg"):
+        info.setProperty("quality", 90)
+    success = doc.exportImage(path, info)
+    if success:
+        return {"success": True, "message": f"Exported document to '{path}'"}
+    return {"success": False, "error": f"Failed to export to '{path}'. Check that the file format is supported and the path is writable."}
+
 
 def execute_tool(tool_name, args):
     logger.debug(f"execute_tool called: {tool_name}, args: {args}")
@@ -708,6 +949,148 @@ def generate_tools():
                         "hex": {"type": "string"}
                     },
                     "required": ["target", "hex"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "selection_get_info",
+                "description": "Get current selection bounds (x, y, width, height). Returns error if no selection exists. Use this to check what area is selected before operating on it.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "layer_copy_selection",
+                "description": "Copy the current selection region from a source layer into a new layer. The new layer contains only the pixels within the selection, placed at the same position. Requires an existing selection. Use this to extract parts of an image onto separate layers.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source_layer_name": {"type": "string", "description": "Layer to copy from (default: active layer)"},
+                        "new_layer_name": {"type": "string", "description": "Name for the new layer (default: 'Copied Selection')"}
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "layer_set_active",
+                "description": "Set the active layer by name. The active layer is the target for most operations.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "layer_name": {"type": "string", "description": "Name of the layer to make active"}
+                    },
+                    "required": ["layer_name"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "layer_merge_down",
+                "description": "Merge the active layer with the layer directly below it. The result replaces both layers. Cannot merge the bottommost layer.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "layer_flatten",
+                "description": "Flatten all visible layers into a single layer. Hidden layers are discarded.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "layer_rename",
+                "description": "Rename a layer",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "layer_name": {"type": "string", "description": "Current name of the layer"},
+                        "new_name": {"type": "string", "description": "New name for the layer"}
+                    },
+                    "required": ["layer_name", "new_name"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "layer_clear",
+                "description": "Clear all pixel content from a layer (make it fully transparent). If a selection exists, only clears within the selection. Otherwise clears the entire layer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "layer_name": {"type": "string", "description": "Layer to clear (default: active layer)"}
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "layer_transform",
+                "description": "Flip a layer horizontally or vertically. Works by manipulating pixel data directly, supporting any color model and depth.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "layer_name": {"type": "string", "description": "Layer to transform (default: active layer)"},
+                        "action": {"type": "string", "enum": ["flip_horizontal", "flip_vertical"]}
+                    },
+                    "required": ["action"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "document_scale",
+                "description": "Scale the entire document to new dimensions. This resizes both the canvas and all layer content. Different from document_resize which only changes canvas size.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "width": {"type": "number", "minimum": 1, "description": "New width in pixels"},
+                        "height": {"type": "number", "minimum": 1, "description": "New height in pixels"}
+                    },
+                    "required": ["width", "height"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "document_new",
+                "description": "Create a new blank document and open it in the active window. The new document uses RGBA 8-bit color mode.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "width": {"type": "number", "minimum": 1, "description": "Width in pixels (default: 1920)"},
+                        "height": {"type": "number", "minimum": 1, "description": "Height in pixels (default: 1080)"},
+                        "name": {"type": "string", "description": "Document name (default: 'Untitled')"},
+                        "resolution": {"type": "number", "description": "Resolution in PPI (default: 72)"}
+                    },
+                    "required": ["width", "height"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "export_image",
+                "description": "Export the current document to a file. IMPORTANT: Cannot overwrite the currently open document — must export to a new file path. Supports PNG and JPEG formats.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path to save to (must not be the currently open file)"},
+                        "format": {"type": "string", "enum": ["png", "jpg"]}
+                    },
+                    "required": ["path"]
                 }
             }
         }
