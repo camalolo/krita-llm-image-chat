@@ -1,16 +1,17 @@
 from krita import DockWidget
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
                               QPushButton, QCheckBox, QLabel, QTextEdit,
-                              QApplication, QDialog)
+                              QDialog)
 from PyQt5.QtCore import Qt, QEvent, QTimer
 
-from .config import DEFAULT_MODEL, TIMEOUT_SECONDS, SETTINGS_PATH, logger, log_exception, get_valid_model_id
+from .config import DEFAULT_MODEL, TIMEOUT_SECONDS, RETRY_COUNT, SETTINGS_PATH, logger, log_exception, get_valid_model_id
 from .settings_dialog import SettingsDialog
 from .image_capture import get_current_image_base64
 from .api_client import ConversationWorker, build_user_message, process_response, truncate_messages
 import json
 import os
 import time
+import html
 
 
 class LLMChatDocker(DockWidget):
@@ -26,9 +27,14 @@ class LLMChatDocker(DockWidget):
         self._history_index = -1
         self._draft_text = ""
         self._worker = None
+        self._tool_round = 0
         self._countdown_timer = QTimer(self)
         self._countdown_timer.timeout.connect(self._update_countdown)
         self._countdown_start = 0
+        self._spinner_frame = 0
+        self._watchdog_timer = QTimer(self)
+        self._watchdog_timer.setSingleShot(True)
+        self._watchdog_timer.timeout.connect(self._on_worker_timeout)
         self.setup_ui()
         self.load_settings()
         logger.info("LLMChatDocker initialized successfully")
@@ -135,10 +141,13 @@ class LLMChatDocker(DockWidget):
 
     def clear_conversation(self):
         logger.info("Clearing conversation history")
+        self._watchdog_timer.stop()
         self.messages = []
         self._history = []
         self._history_index = -1
         self._draft_text = ""
+        self._tool_round = 0
+        self._spinner_frame = 0
         self.chat_history.clear()
         self.add_message("System", "Conversation cleared.")
 
@@ -162,7 +171,6 @@ class LLMChatDocker(DockWidget):
         self.input_edit.setEnabled(False)
         self.include_image_cb.setEnabled(False)
         self.clear_button.setEnabled(False)
-        QApplication.processEvents()
 
     def set_ready(self):
         self.status_label.setText("")
@@ -176,20 +184,16 @@ class LLMChatDocker(DockWidget):
         logger.info("Abort requested by user")
         self._abort_flag = True
         self._countdown_timer.stop()
+        self._watchdog_timer.stop()
 
         if self._worker and self._worker.isRunning():
             self._worker.abort()
-            try:
-                self._worker.response_ready.disconnect(self._on_response)
-            except:
-                pass
-            try:
-                self._worker.error_occurred.disconnect(self._on_error)
-            except:
-                pass
-            self._worker.terminate()
-            self._worker.wait(3000)
-            logger.info("Worker thread terminated")
+            self._worker.wait(5000)
+            if self._worker.isRunning():
+                logger.warning("Worker did not exit cleanly after abort, terminating as last resort")
+                self._worker.terminate()
+                self._worker.wait(2000)
+            logger.info("Worker thread stopped")
 
         self._worker = None
         self.set_ready()
@@ -231,11 +235,15 @@ class LLMChatDocker(DockWidget):
             return
 
         self.messages.append(build_user_message(user_input, image_b64))
-
+        self._tool_round = 0
+        self._spinner_frame = 0
         self._start_api_call()
 
     def _start_api_call(self):
-        self.set_busy("Waiting for LLM response...")
+        if self._tool_round > 0:
+            self.set_busy(f"Step {self._tool_round}...")
+        else:
+            self.set_busy("Waiting for LLM response...")
 
         self._worker = ConversationWorker(self.messages, self.settings, parent=self)
         self._worker.response_ready.connect(self._on_response)
@@ -245,12 +253,22 @@ class LLMChatDocker(DockWidget):
         self._countdown_start = time.time()
         self._countdown_timer.start(1000)
 
+        max_wait = TIMEOUT_SECONDS * RETRY_COUNT + 15
+        self._watchdog_timer.start(max_wait * 1000)
+
     def _update_countdown(self):
         elapsed = time.time() - self._countdown_start
-        self.status_label.setText(f"Waiting for LLM response... ({elapsed:.0f}s)")
+        frames = ["●○○", "○●○", "○○●"]
+        self._spinner_frame = (self._spinner_frame + 1) % len(frames)
+        spinner = frames[self._spinner_frame]
+        if self._tool_round > 0:
+            self.status_label.setText(f"{spinner} Step {self._tool_round} ({elapsed:.0f}s)...")
+        else:
+            self.status_label.setText(f"{spinner} Waiting for LLM response... ({elapsed:.0f}s)")
 
     def _on_response(self, response):
         self._countdown_timer.stop()
+        self._watchdog_timer.stop()
 
         if self._abort_flag:
             self._worker = None
@@ -258,7 +276,13 @@ class LLMChatDocker(DockWidget):
 
         self._worker = None
 
-        events = process_response(response, self.messages, self)
+        try:
+            events = process_response(response, self.messages, self)
+        except Exception as e:
+            log_exception(e, "_on_response")
+            self.set_ready()
+            self.add_message("Error", f"Error processing response: {str(e)}")
+            return
 
         if events is None:
             self.set_ready()
@@ -281,16 +305,25 @@ class LLMChatDocker(DockWidget):
 
         has_tool_calls = any(e["type"] in ("tool_start", "tool_result") for e in events)
         if has_tool_calls:
+            self._tool_round += 1
+            MAX_TOOL_ROUNDS = 15
+            if self._tool_round >= MAX_TOOL_ROUNDS:
+                self.add_message("System", f"⚠ Stopped after {MAX_TOOL_ROUNDS} tool calls. Please try a simpler request or clear the conversation.")
+                self.set_ready()
+                return
             truncate_messages(self.messages)
             if self._abort_flag:
                 self.set_ready()
                 return
+            self.set_busy(f"Step {self._tool_round}...")
             self._start_api_call()
         else:
+            self._tool_round = 0
             self.set_ready()
 
     def _on_error(self, error_msg):
         self._countdown_timer.stop()
+        self._watchdog_timer.stop()
 
         if self._abort_flag:
             self._worker = None
@@ -299,6 +332,20 @@ class LLMChatDocker(DockWidget):
         self._worker = None
         self.set_ready()
         self.add_message("Error", error_msg)
+
+    def _on_worker_timeout(self):
+        self._countdown_timer.stop()
+        logger.error("Worker thread watchdog triggered — worker appears dead")
+        if self._worker and self._worker.isRunning():
+            self._abort_flag = True
+            self._worker.abort()
+            self._worker.wait(2000)
+            if self._worker.isRunning():
+                self._worker.terminate()
+                self._worker.wait(2000)
+        self._worker = None
+        self.set_ready()
+        self.add_message("Error", "Request timed out. The API may be temporarily unavailable.")
 
     def add_message(self, sender, text):
         logger.debug(f"UI Message [{sender}]: {text[:100]}{'...' if len(text) > 100 else ''}")
@@ -312,7 +359,8 @@ class LLMChatDocker(DockWidget):
         }
         color = colors.get(sender, "#000000")
 
-        formatted = f'<p><span style="color:{color}; font-weight:bold;">{sender}:</span> {text}</p>'
+        escaped_text = html.escape(str(text))
+        formatted = f'<p><span style="color:{color}; font-weight:bold;">{sender}:</span> {escaped_text}</p>'
         self.chat_history.append(formatted)
 
         scrollbar = self.chat_history.verticalScrollBar()

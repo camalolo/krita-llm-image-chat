@@ -2,7 +2,6 @@ import json
 import time
 import urllib.request
 import urllib.error
-import traceback
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from .config import (
@@ -125,15 +124,18 @@ def _make_api_request(messages, settings, abort_check):
             try:
                 error_data = json.loads(error_body)
                 api_message = error_data.get("error", {}).get("message", error_body[:200])
-            except:
+            except Exception:
                 api_message = error_body[:200]
 
-            if code >= 500:
+            if code >= 500 or code == 429:
                 if attempt < RETRY_COUNT - 1:
-                    logger.info(f"[Worker] Server error {code}, retrying...")
-                    time.sleep(1)
+                    wait_time = 2 ** attempt  # 1, 2, 4 seconds
+                    logger.info(f"[Worker] HTTP {code}, waiting {wait_time}s before retry {attempt + 2}/{RETRY_COUNT}...")
+                    if not abort_check():
+                        time.sleep(wait_time)
                     continue
-                return None, f"[HTTP {code}] Server error. {api_message}"
+                error_type = "rate limit" if code == 429 else "server error"
+                return None, f"[HTTP {code}] {error_type}. {api_message} Please wait a moment and try again."
 
             if code == 404:
                 return None, f"[HTTP 404] {api_message} Try selecting a different model in Settings."
@@ -145,7 +147,10 @@ def _make_api_request(messages, settings, abort_check):
 
             if "timed out" in reason.lower() or "10060" in reason:
                 if attempt < RETRY_COUNT - 1:
-                    logger.info("[Worker] Socket timeout, retrying...")
+                    wait_time = 2 ** attempt
+                    logger.info(f"[Worker] Socket timeout, waiting {wait_time}s before retry...")
+                    if not abort_check():
+                        time.sleep(wait_time)
                     continue
                 return None, f"Request timed out after {RETRY_COUNT} attempts ({TIMEOUT_SECONDS}s each)."
 
@@ -209,9 +214,13 @@ def process_response(response_data, messages, ui):
         for tc in message["tool_calls"]:
             logger.debug(f"Tool call: {tc['function']['name']}, args preview: {tc['function']['arguments'][:100]}...")
 
-    history_message = {"role": "assistant", "content": message.get("content")}
+    history_message = {"role": "assistant", "content": message.get("content") or ""}
     if "tool_calls" in message:
-        history_message["tool_calls"] = message["tool_calls"]
+        clean_tool_calls = []
+        for tc in message["tool_calls"]:
+            clean_tc = {k: v for k, v in tc.items() if k != "index"}
+            clean_tool_calls.append(clean_tc)
+        history_message["tool_calls"] = clean_tool_calls
     messages.append(history_message)
 
     events = []

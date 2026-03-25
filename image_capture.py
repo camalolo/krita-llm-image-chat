@@ -6,32 +6,32 @@ import base64
 
 
 def get_current_image_base64():
-    """Capture the active layer as JPEG base64, resized to max 1024px."""
+    """Capture the document as JPEG base64, resized to max 1024px.
+
+    Uses the document projection (composited view) which is always BGRA U8,
+    making it reliable across all color models and depths.
+    """
     logger.debug("get_current_image_base64() called")
     doc = Krita.instance().activeDocument()
     if not doc:
         logger.warning("No active document found")
         return None
 
-    node = doc.activeNode()
-    if not node:
-        logger.warning("No active node found")
-        return None
-
     w = doc.width()
     h = doc.height()
-    logger.debug(f"Document size: {w}x{h}, active node: {node.name()}")
+    logger.debug(f"Document size: {w}x{h}, color model: {doc.colorModel()}, depth: {doc.colorDepth()}")
 
     try:
-        pixel_data = node.pixelData(0, 0, w, h)
-        logger.debug(f"Got pixel data, length: {len(pixel_data) if pixel_data else 'None'}")
+        pixel_data = doc.projectionPixelData(0, 0, w, h)
+        logger.debug(f"Got projection pixel data, length: {len(pixel_data) if pixel_data else 'None'}")
 
-        if not pixel_data or len(pixel_data) < w * h * 4:
-            logger.warning("Pixel data is empty or too small for document dimensions")
+        expected_size = w * h * 4
+        if not pixel_data or len(pixel_data) < expected_size:
+            logger.warning(f"Pixel data is empty or too small: got {len(pixel_data) if pixel_data else 0}, expected {expected_size}")
             return None
 
         qimage = QImage(pixel_data, w, h, QImage.Format_ARGB32)
-        qimage = qimage.rgbSwapped()
+        qimage = qimage.copy()
 
         max_size = 1024
         if w > max_size or h > max_size:

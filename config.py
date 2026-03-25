@@ -1,5 +1,6 @@
 import os
 import logging
+from logging.handlers import RotatingFileHandler
 import traceback
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -8,7 +9,7 @@ SETTINGS_PATH = os.path.join(PLUGIN_DIR, "settings.json")
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 RETRY_COUNT = 3
-TIMEOUT_SECONDS = 30
+TIMEOUT_SECONDS = 60
 
 MODELS = [
     ("mistralai/mistral-small-3.1-24b-instruct:free", True),
@@ -73,12 +74,13 @@ WORKFLOW:
 Respond naturally. Use tools when you need to modify the image or gather information."""
 
 
-logging.basicConfig(
-    filename=LOG_PATH,
-    level=logging.DEBUG,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+_handler = RotatingFileHandler(
+    LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=2, encoding='utf-8'
 )
+_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+_handler.setLevel(logging.DEBUG)
+logging.getLogger().addHandler(_handler)
+logging.getLogger().setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 

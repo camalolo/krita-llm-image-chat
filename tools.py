@@ -1,6 +1,5 @@
 from krita import Krita, Selection, InfoObject, ManagedColor
 from .config import logger, log_exception
-import json
 import os
 
 BLEND_MODES = ["normal", "multiply", "screen", "overlay", "darken",
@@ -46,13 +45,14 @@ def _get_document():
     return doc
 
 def _find_layer(doc, layer_name=None):
+    """Find a layer by name, searching recursively inside group layers."""
     if layer_name:
         logger.debug(f"Finding layer by name: {layer_name}")
         root = doc.rootNode()
-        for node in root.childNodes():
-            if node.name() == layer_name:
-                logger.debug(f"Found layer: {layer_name}")
-                return node
+        result = _find_layer_recursive(root, layer_name)
+        if result:
+            logger.debug(f"Found layer: {layer_name}")
+            return result
         logger.error(f"Layer not found: {layer_name}")
         raise Exception(f"Layer not found: {layer_name}")
     layer = doc.activeNode()
@@ -61,6 +61,18 @@ def _find_layer(doc, layer_name=None):
         raise Exception("No active layer")
     logger.debug(f"Using active layer: {layer.name()}")
     return layer
+
+
+def _find_layer_recursive(node, layer_name):
+    """Recursively search for a layer by name within a node's children."""
+    for child in node.childNodes():
+        if child.name() == layer_name:
+            return child
+        if child.type() == "grouplayer":
+            result = _find_layer_recursive(child, layer_name)
+            if result:
+                return result
+    return None
 
 def _opacity_to_krita(opacity):
     return int(opacity * 255 / 100)
@@ -370,32 +382,29 @@ def handle_document_crop(args):
     y = args.get("y")
     w = args.get("w")
     h = args.get("h")
-    if x is None or y is None or w is None or h is None:
+    if x is not None and y is not None and w is not None and h is not None:
+        selection = Selection()
+        selection.select(int(x), int(y), int(w), int(h), 255)
+        doc.setSelection(selection)
+    else:
         selection = doc.selection()
-        if selection:
-            x = selection.x()
-            y = selection.y()
-            w = selection.width()
-            h = selection.height()
-        else:
+        if not selection:
             return {"success": False, "error": "No bounds specified and no selection exists"}
-    doc.cropImage(x, y, w, h)
-    doc.refreshProjection()
-    return {"success": True, "message": f"Cropped document to {w}x{h}"}
+    action = Krita.instance().action("crop_to_selection")
+    if action:
+        action.trigger()
+        doc.refreshProjection()
+        return {"success": True, "message": "Cropped document to selection"}
+    return {"success": False, "error": "Crop action not available"}
 
 @register_handler("fill")
 def handle_fill(args):
     doc = _get_document()
     fill_type = args.get("type", "foreground")
     color_hex = args.get("color")
-    pattern_name = args.get("pattern_name")
     layer = doc.activeNode()
     if not layer:
         return {"success": False, "error": "No active layer"}
-    selection = doc.selection()
-    if not selection:
-        selection = Selection()
-        selection.select(0, 0, doc.width(), doc.height(), 255)
     krita = Krita.instance()
     view = krita.activeWindow().activeView()
     if color_hex:
@@ -405,15 +414,18 @@ def handle_fill(args):
         elif fill_type == "background":
             view.setBackGroundColor(color)
     if fill_type == "foreground":
-        fg_color = view.foregroundColor()
-        layer.setPixelData(fg_color.data(), selection.x(), selection.y(), selection.width(), selection.height())
+        action = Krita.instance().action("fill_foreground")
     elif fill_type == "background":
-        bg_color = view.backgroundColor()
-        layer.setPixelData(bg_color.data(), selection.x(), selection.y(), selection.width(), selection.height())
-    elif fill_type == "pattern" and pattern_name:
+        action = Krita.instance().action("fill_background")
+    elif fill_type == "pattern" and args.get("pattern_name"):
         return {"success": False, "error": "Pattern fill not yet implemented"}
-    doc.refreshProjection()
-    return {"success": True, "message": f"Filled selection with {fill_type}"}
+    else:
+        action = Krita.instance().action("fill_foreground")
+    if action:
+        action.trigger()
+        doc.refreshProjection()
+        return {"success": True, "message": f"Filled selection with {fill_type}"}
+    return {"success": False, "error": "Fill action not available"}
 
 def _hex_to_managed_color(hex_color, doc):
     hex_color = hex_color.lstrip('#')
@@ -485,12 +497,9 @@ def handle_layer_set_active(args):
     layer_name = args.get("layer_name")
     if not layer_name:
         return {"success": False, "error": "layer_name is required"}
-    root = doc.rootNode()
-    for node in root.childNodes():
-        if node.name() == layer_name:
-            doc.setActiveNode(node)
-            return {"success": True, "message": f"Active layer set to '{layer_name}'"}
-    return {"success": False, "error": f"Layer '{layer_name}' not found"}
+    layer = _find_layer(doc, layer_name)
+    doc.setActiveNode(layer)
+    return {"success": True, "message": f"Active layer set to '{layer_name}'"}
 
 
 @register_handler("layer_merge_down")
@@ -613,8 +622,8 @@ def handle_document_scale(args):
         return {"success": False, "error": "Width and height must be at least 1"}
     try:
         doc.scaleImage(width, height, doc.resolution(), doc.resolution(), "Bicubic")
-    except Exception:
-        doc.resizeImage(0, 0, width, height, doc.resolution())
+    except Exception as e:
+        return {"success": False, "error": f"Failed to scale image: {str(e)}. The Krita API may not support scaling for this document type."}
     doc.refreshProjection()
     return {"success": True, "message": f"Scaled document to {width}x{height}"}
 
@@ -639,7 +648,6 @@ def handle_document_new(args):
 
 @register_handler("export_image")
 def handle_export_image(args):
-    import os
     doc = _get_document()
     path = args.get("path")
     file_format = args.get("format", "png")
@@ -654,7 +662,7 @@ def handle_export_image(args):
     if not ext:
         path = f"{path}.{file_format}"
     info = InfoObject()
-    if file_format in ("jpeg", "jpg"):
+    if file_format == "jpeg":
         info.setProperty("quality", 90)
     success = doc.exportImage(path, info)
     if success:
@@ -677,8 +685,17 @@ def execute_tool(tool_name, args):
         log_exception(e, f"execute_tool({tool_name})")
         return {"success": False, "error": str(e)}
 
+_cached_tools = None
+
+
 def generate_tools():
-    logger.debug("generate_tools() called")
+    """Generate tool schemas for the API. Results are cached for the session."""
+    global _cached_tools
+    if _cached_tools is not None:
+        logger.debug(f"Returning {len(_cached_tools)} cached tool schemas")
+        return _cached_tools
+    
+    logger.debug("generate_tools() called (first invocation, building cache)")
     krita = Krita.instance()
     filter_names = list(krita.filters())
     logger.debug(f"Discovered {len(filter_names)} filters: {filter_names[:10]}...")
@@ -1095,5 +1112,6 @@ def generate_tools():
             }
         }
     ]
-    logger.debug(f"Generated {len(tools)} tool schemas")
+    _cached_tools = tools
+    logger.debug(f"Cached {len(tools)} tool schemas")
     return tools
