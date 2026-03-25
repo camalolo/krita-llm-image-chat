@@ -297,9 +297,6 @@ def handle_selection_create(args):
         return {"success": True, "message": "Cleared selection"}
     elif sel_type == "rect":
         selection.select(x, y, w, h, 255)
-    elif sel_type == "ellipse":
-        selection.select(x, y, w, h, 255)
-        selection.shape = "ellipse"
     doc.setSelection(selection)
     return {"success": True, "message": f"Created {sel_type} selection"}
 
@@ -406,7 +403,9 @@ def handle_fill(args):
     if not layer:
         return {"success": False, "error": "No active layer"}
     krita = Krita.instance()
-    view = krita.activeWindow().activeView()
+    view = krita.activeWindow().activeView() if krita.activeWindow() else None
+    if not view:
+        return {"success": False, "error": "No active window/view"}
     if color_hex:
         color = _hex_to_managed_color(color_hex, doc)
         if fill_type == "foreground":
@@ -434,7 +433,26 @@ def _hex_to_managed_color(hex_color, doc):
     b = int(hex_color[4:6], 16) / 255.0
     a = int(hex_color[6:8], 16) / 255.0 if len(hex_color) > 6 else 1.0
     color = ManagedColor(doc.colorModel(), doc.colorDepth(), doc.colorProfile())
-    color.setComponents([r, g, b, a])
+    model = doc.colorModel().upper()
+    if model in ("CMYK", "CMYKA"):
+        # Convert RGB to CMYK: C=1-R, M=1-G, Y=1-B, K=min(C,M,Y)
+        c = 1.0 - r
+        m = 1.0 - g
+        y = 1.0 - b
+        k = min(c, m, y)
+        if k > 0:
+            c = (c - k) / (1.0 - k)
+            m = (m - k) / (1.0 - k)
+            y = (y - k) / (1.0 - k)
+        color.setComponents([c, m, y, k, a])
+    elif model in ("GRAY", "GRAYA"):
+        gray = 0.299 * r + 0.587 * g + 0.114 * b
+        if model == "GRAYA":
+            color.setComponents([gray, a])
+        else:
+            color.setComponents([gray])
+    else:
+        color.setComponents([r, g, b, a])
     return color
 
 @register_handler("set_color")
@@ -443,7 +461,9 @@ def handle_set_color(args):
     target = args.get("target", "foreground")
     hex_color = args.get("hex", "#000000")
     krita = Krita.instance()
-    view = krita.activeWindow().activeView()
+    view = krita.activeWindow().activeView() if krita.activeWindow() else None
+    if not view:
+        return {"success": False, "error": "No active window/view"}
     color = _hex_to_managed_color(hex_color, doc)
     if target == "foreground":
         view.setForeGroundColor(color)
@@ -576,8 +596,9 @@ def handle_layer_transform(args):
     if not action_type:
         return {"success": False, "error": "action is required (flip_horizontal or flip_vertical)"}
 
-    w, h = doc.width(), doc.height()
-    pixel_data = layer.pixelData(0, 0, w, h)
+    bounds = layer.bounds()
+    w, h = bounds.width(), bounds.height()
+    pixel_data = layer.pixelData(bounds.x(), bounds.y(), w, h)
 
     depth_bytes = {"U8": 1, "U16": 2, "F16": 2, "F32": 4}
     channel_map = {"GRAY": 1, "GRAYA": 2, "RGB": 3, "RGBA": 4, "CMYK": 4, "CMYKA": 5, "LAB": 3, "LABA": 4, "XYZ": 3, "XYZA": 4}
@@ -608,7 +629,7 @@ def handle_layer_transform(args):
     else:
         return {"success": False, "error": f"Unknown action: {action_type}. Supported: flip_horizontal, flip_vertical"}
 
-    layer.setPixelData(bytes(data), 0, 0, w, h)
+    layer.setPixelData(bytes(data), bounds.x(), bounds.y(), w, h)
     doc.refreshProjection()
     return {"success": True, "message": f"Applied {action_type} to '{layer.name()}'"}
 
@@ -765,7 +786,10 @@ def execute_tool(tool_name, args):
         logger.debug(f"Calling handler for {tool_name}")
         result = handler(args if args else {})
         logger.debug(f"Handler returned: {result}")
-        return result if result else {"success": True}
+        if not isinstance(result, dict):
+            logger.warning(f"Handler for {tool_name} returned non-dict: {type(result).__name__}: {result}")
+            result = {"success": True, "message": str(result)} if result else {"success": True}
+        return result
     except Exception as e:
         log_exception(e, f"execute_tool({tool_name})")
         return {"success": False, "error": str(e)}
@@ -787,7 +811,7 @@ def generate_tools():
     
     anchor_options = ["center", "top-left", "top", "top-right", "left", 
                       "right", "bottom-left", "bottom", "bottom-right"]
-    selection_types = ["all", "rect", "ellipse", "none"]
+    selection_types = ["all", "rect", "none"]
     modify_actions = ["invert", "feather", "grow", "shrink", "smooth"]
     layer_types = ["paint", "group", "vector"]
     move_directions = ["up", "down", "top", "bottom"]
