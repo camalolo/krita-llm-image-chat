@@ -6,6 +6,7 @@ import traceback
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(PLUGIN_DIR, "llm_image_chat.log")
 SETTINGS_PATH = os.path.join(PLUGIN_DIR, "settings.json")
+HISTORY_PATH = os.path.join(PLUGIN_DIR, "history.json")
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 RETRY_COUNT = 3

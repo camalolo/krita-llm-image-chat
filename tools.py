@@ -1,4 +1,5 @@
 from krita import Krita, Selection, InfoObject, ManagedColor
+from PyQt5.QtGui import QColor
 from .config import logger, log_exception
 import os
 
@@ -28,6 +29,8 @@ BLEND_MODE_MAP = {
 }
 
 TOOL_HANDLERS = {}
+
+_filter_backups = {}
 
 def register_handler(name):
     def decorator(func):
@@ -117,7 +120,9 @@ def handle_apply_filter(args):
         return {"success": False, "error": "No active layer"}
     filter_name = args.get("name")
     intensity = args.get("intensity", 50)
-    logger.debug(f"Filter name: {filter_name}, intensity: {intensity}")
+    target_color = args.get("target_color")  # hex string like "#FFFFFF"
+    threshold = args.get("threshold")  # int 0-255
+    logger.debug(f"Filter name: {filter_name}, intensity: {intensity}, target_color: {target_color}, threshold: {threshold}")
     
     krita = Krita.instance()
     available_filters = list(krita.filters())
@@ -131,41 +136,80 @@ def handle_apply_filter(args):
         logger.debug(f"Created filter object for {filter_name}")
         config = filter_obj.configuration()
         if config:
-            logger.debug(f"Filter has configuration, properties: {[p.name for p in config.properties()]}")
+            props = config.properties()
+            logger.debug(f"Filter has configuration, properties: {props}")
             set_any = False
-            for prop in config.properties():
-                prop_name = prop.name.lower()
-                if any(x in prop_name for x in ["radius", "strength", "intensity", "amount", "level"]):
-                    logger.debug(f"Found target property {prop.name}, type hint: {type(prop)}, min: {prop.min}, max: {prop.max}")
+            parts = []
+            # Set intensity-like properties
+            for prop_name in props:
+                if isinstance(prop_name, str):
+                    prop_lower = prop_name.lower()
+                else:
+                    prop_lower = str(prop_name).lower()
+                    prop_name = str(prop_name)
+                if any(x in prop_lower for x in ["radius", "strength", "intensity", "amount", "level"]):
+                    logger.debug(f"Found intensity property {prop_name}")
                     try:
-                        prop_min = prop.min
-                        prop_max = prop.max
-                        if prop_min is not None and prop_max is not None and prop_max > prop_min:
-                            normalized = prop_min + (intensity / 100.0) * (prop_max - prop_min)
-                        else:
-                            try:
-                                test_val = config.property(prop.name)
-                                if isinstance(test_val, float):
-                                    normalized = intensity / 100.0
-                                else:
-                                    normalized = int(intensity / 100.0 * 255)
-                            except Exception:
+                        try:
+                            test_val = config.property(prop_name)
+                            if isinstance(test_val, float):
+                                normalized = intensity / 100.0
+                            elif isinstance(test_val, int):
+                                normalized = int(intensity / 100.0 * 255)
+                            else:
                                 normalized = intensity
-                        config.setProperty(prop.name, normalized)
+                        except Exception:
+                            normalized = intensity
+                        config.setProperty(prop_name, normalized)
                         set_any = True
-                        logger.debug(f"Set property {prop.name} to {normalized} (from intensity {intensity})")
+                        logger.debug(f"Set property {prop_name} to {normalized} (from intensity {intensity})")
                     except Exception as e:
-                        logger.warning(f"Failed to set property {prop.name}: {e}")
+                        logger.warning(f"Failed to set property {prop_name}: {e}")
                     break
+            # Set target_color property (e.g. colortoalpha's "targetcolor")
+            if target_color:
+                for prop_name in props:
+                    pname = str(prop_name).lower()
+                    if "color" in pname and "target" in pname:
+                        try:
+                            color = QColor(target_color)
+                            if color.isValid():
+                                config.setProperty(prop_name, color)
+                                set_any = True
+                                parts.append(f"target_color={target_color}")
+                                logger.debug(f"Set property {prop_name} to {target_color}")
+                        except Exception as e:
+                            logger.warning(f"Failed to set targetcolor property {prop_name}: {e}")
+                        break
+            # Set threshold property (e.g. colortoalpha's "threshold")
+            if threshold is not None:
+                for prop_name in props:
+                    pname = str(prop_name).lower()
+                    if "threshold" in pname:
+                        try:
+                            config.setProperty(prop_name, int(threshold))
+                            set_any = True
+                            parts.append(f"threshold={threshold}")
+                            logger.debug(f"Set property {prop_name} to {threshold}")
+                        except Exception as e:
+                            logger.warning(f"Failed to set threshold property {prop_name}: {e}")
+                        break
             if not set_any:
-                logger.warning(f"No suitable property found on filter '{filter_name}' to set intensity")
-                return {"success": False, "error": f"Filter '{filter_name}' has no adjustable intensity property"}
+                logger.debug(f"No adjustable properties found on filter '{filter_name}', applying with defaults")
             filter_obj.setConfiguration(config)
         logger.debug(f"Applying filter to layer {layer.name()}")
-        filter_obj.apply(layer, 0, 0, doc.width(), doc.height())
+        # In-memory pixel backup for undo (stored as bytes, no Krita layer created)
+        layer_name = layer.name()
+        w, h = doc.width(), doc.height()
+        _filter_backups[layer_name] = (bytes(layer.pixelData(0, 0, w, h)), w, h)
+        logger.debug(f"Stored in-memory pixel backup for layer '{layer_name}' ({w}x{h})")
+        filter_obj.apply(layer, 0, 0, w, h)
         doc.refreshProjection()
-        logger.info(f"Successfully applied filter '{filter_name}' with intensity {intensity}")
-        return {"success": True, "message": f"Applied filter '{filter_name}' with intensity {intensity}"}
+        msg = f"Applied filter '{filter_name}'"
+        if parts:
+            msg += f" ({', '.join(parts)})"
+        logger.info(msg)
+        return {"success": True, "message": msg}
     logger.error(f"Could not create filter: {filter_name}")
     return {"success": False, "error": f"Could not create filter: {filter_name}"}
 
@@ -651,6 +695,18 @@ def handle_document_scale(args):
 
 @register_handler("undo")
 def handle_undo(args):
+    """Undo the last operation. Checks for in-memory filter backup first, then falls back to Krita's built-in undo."""
+    doc = _get_document()
+    layer = doc.activeNode()
+    if layer:
+        layer_name = layer.name()
+        backup = _filter_backups.get(layer_name)
+        if backup:
+            old_data, w, h = backup
+            layer.setPixelData(old_data, 0, 0, w, h)
+            del _filter_backups[layer_name]
+            doc.refreshProjection()
+            return {"success": True, "message": f"Reverted filter on layer '{layer_name}'"}
     krita = Krita.instance()
     action = krita.action("edit_undo")
     if not action:
@@ -671,7 +727,6 @@ def handle_redo(args):
         return {"success": False, "error": "Nothing to redo"}
     action.trigger()
     return {"success": True, "message": "Redo performed"}
-
 
 @register_handler("document_new")
 def handle_document_new(args):
@@ -760,6 +815,7 @@ def handle_save_document(args):
 def handle_split_export_regions(args):
     doc = _get_document()
     regions = args.get("regions")
+    overwrite = args.get("overwrite", False)
     if not regions or not isinstance(regions, list):
         return {"success": False, "error": "regions is required and must be a list of {x, y, w, h, path} objects"}
     
@@ -787,6 +843,11 @@ def handle_split_export_regions(args):
             file_format = ext.lstrip('.').lower()
             if file_format == "jpg":
                 file_format = "jpeg"
+            
+            # Safety: don't overwrite existing files unless explicitly requested
+            if os.path.exists(path) and not overwrite:
+                results.append({"index": i, "success": False, "path": path, "error": "File already exists (set overwrite=true to replace)"})
+                continue
             
             # Safety: cannot overwrite the currently open document
             if current_path and os.path.normpath(path) == current_path:
@@ -846,6 +907,7 @@ def handle_export_image(args):
     doc = _get_document()
     path = args.get("path")
     file_format = args.get("format", "png")
+    overwrite = args.get("overwrite", False)
     if not path:
         return {"success": False, "error": "path is required"}
     if file_format == "jpg":
@@ -856,6 +918,8 @@ def handle_export_image(args):
     current_path = doc.fileName()
     if current_path and os.path.normpath(path) == os.path.normpath(current_path):
         return {"success": False, "error": "Cannot overwrite the currently open document. Export to a different file path."}
+    if os.path.exists(path) and not overwrite:
+        return {"success": False, "error": "File already exists (set overwrite=true to replace)"}
     info = InfoObject()
     if file_format == "jpeg":
         info.setProperty("quality", 90)
@@ -925,12 +989,14 @@ def generate_tools():
             "type": "function",
             "function": {
                 "name": "apply_filter",
-                "description": "Apply filter to active layer",
+                "description": "Apply filter to active layer. Automatically stores pre-filter pixels in memory so the filter can be reverted with undo. For color-to-alpha filters, set target_color to the hex color to make transparent (e.g. '#FFFFFF' for white background). Set threshold to control color-matching sensitivity (0=exact, 255=match all).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "name": {"type": "string", "enum": filter_names},
-                        "intensity": {"type": "number", "minimum": 0, "maximum": 100}
+                        "intensity": {"type": "number", "minimum": 0, "maximum": 100},
+                        "target_color": {"type": "string", "description": "Hex color (e.g. '#FFFFFF') for filters that target a specific color (e.g. colortoalpha)"},
+                        "threshold": {"type": "integer", "minimum": 0, "maximum": 255, "description": "Per-channel color distance tolerance. 0=exact match only. 15-30=catches anti-aliased edges and slight off-white (recommended for 'remove background'). 50=very loose. 100+=matches nearly everything. If user says color 'still shows' increase by ~10. If 'too much removed' decrease by ~10."}
                     },
                     "required": ["name"]
                 }
@@ -940,7 +1006,7 @@ def generate_tools():
             "type": "function",
             "function": {
                 "name": "layer_create",
-                "description": "Create new layer",
+                "description": "Create a new layer. Type 'paint' (default) creates a raster/drawing layer. Type 'group' creates a group container for organizing layers. Type 'vector' creates a vector layer for shapes and curves. Set opacity (0-100) and blend_mode on creation.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1028,7 +1094,7 @@ def generate_tools():
             "type": "function",
             "function": {
                 "name": "layer_move",
-                "description": "Move layer in stack",
+                "description": "Move a layer up or down in the layer stack. 'up'/'down' moves one position at a time. 'top' moves to the very top, 'bottom' to the very bottom.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1043,7 +1109,7 @@ def generate_tools():
             "type": "function",
             "function": {
                 "name": "selection_create",
-                "description": "Create selection",
+                "description": "Create a selection on the canvas. Type 'rect' creates a rectangular selection at (x, y) with given width/height (defaults to full canvas if omitted). Type 'all' selects the entire canvas. Type 'none' clears any existing selection.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1061,7 +1127,7 @@ def generate_tools():
             "type": "function",
             "function": {
                 "name": "selection_modify",
-                "description": "Modify current selection",
+                "description": "Modify the current selection. Actions: 'invert' selects the unselected area (swaps selection), 'feather' softens edges by value pixels, 'grow' expands selection by value pixels, 'shrink' contracts selection by value pixels, 'smooth' removes jagged edges. Requires an existing selection.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1084,7 +1150,7 @@ def generate_tools():
             "type": "function",
             "function": {
                 "name": "document_resize",
-                "description": "Resize canvas",
+                "description": "Resize the canvas dimensions. Content is NOT scaled — it stays at original size and is repositioned based on the anchor point (default: center). Use document_scale instead to resize content. Anchor options: center, top-left, top, top-right, left, right, bottom-left, bottom, bottom-right.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1100,7 +1166,7 @@ def generate_tools():
             "type": "function",
             "function": {
                 "name": "document_rotate",
-                "description": "Rotate document",
+                "description": "Rotate the entire document. Accepts any angle from -180 to 180 degrees. Common values: 90 (clockwise quarter-turn), -90 (counter-clockwise), 180 (upside-down).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1128,7 +1194,7 @@ def generate_tools():
             "type": "function",
             "function": {
                 "name": "document_crop",
-                "description": "Crop to bounds or selection",
+                "description": "Crop the document. If x, y, w, h are provided, crops to those pixel bounds. If omitted, crops to the current selection. Returns error if no bounds given and no selection exists. Permanently removes pixels outside the crop area.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1144,7 +1210,7 @@ def generate_tools():
             "type": "function",
             "function": {
                 "name": "fill",
-                "description": "Fill selection or layer",
+                "description": "Fill the current selection (or entire layer if no selection) with a color. Type 'foreground' fills with the foreground color — set color param to change it first (e.g. '#FF0000'). Type 'background' fills with background color. Pattern fill is not yet implemented.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1285,7 +1351,7 @@ def generate_tools():
             "type": "function",
             "function": {
                 "name": "undo",
-                "description": "Undo the last operation. Use this to revert changes, e.g. after cropping a document to restore it before extracting the next region.",
+                "description": "Undo the last operation. If the last action was apply_filter, restores pre-filter pixels from memory. Otherwise uses Krita's built-in undo (crop, layer ops, etc.).",
                 "parameters": {
                     "type": "object",
                     "properties": {},
@@ -1359,6 +1425,11 @@ def generate_tools():
                                 },
                                 "required": ["x", "y", "w", "h", "path"]
                             }
+                        },
+                        "overwrite": {
+                            "type": "boolean",
+                            "description": "If true, overwrite existing files at the target paths. If false (default), skip regions where the file already exists and report them as skipped.",
+                            "default": False
                         }
                     },
                     "required": ["regions"]
@@ -1374,7 +1445,12 @@ def generate_tools():
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path to save to (must not be the currently open file)"},
-                        "format": {"type": "string", "enum": ["png", "jpg"]}
+                        "format": {"type": "string", "enum": ["png", "jpg"]},
+                        "overwrite": {
+                            "type": "boolean",
+                            "description": "If true, overwrite existing files at the target path. If false (default), refuse to export if the file already exists.",
+                            "default": False
+                        }
                     },
                     "required": ["path"]
                 }

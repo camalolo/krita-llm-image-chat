@@ -4,10 +4,11 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
                               QDialog)
 from PyQt5.QtCore import Qt, QEvent, QTimer
 
-from .config import DEFAULT_MODEL, TIMEOUT_SECONDS, RETRY_COUNT, SETTINGS_PATH, logger, log_exception, get_valid_model_id
+from .config import DEFAULT_MODEL, TIMEOUT_SECONDS, RETRY_COUNT, SETTINGS_PATH, HISTORY_PATH, logger, log_exception, get_valid_model_id
 from .settings_dialog import SettingsDialog
 from .image_capture import get_current_image_base64
 from .api_client import ConversationWorker, build_user_message, process_response, truncate_messages, sanitize_history
+from .tools import generate_tools
 import json
 import os
 import time
@@ -37,6 +38,7 @@ class LLMChatDocker(DockWidget):
         self._watchdog_timer.timeout.connect(self._on_worker_timeout)
         self.setup_ui()
         self.load_settings()
+        self.load_history()
         logger.info("LLMChatDocker initialized successfully")
 
     def setup_ui(self):
@@ -147,9 +149,105 @@ class LLMChatDocker(DockWidget):
         self._history_index = -1
         self._draft_text = ""
         self._tool_round = 0
+        self._consecutive_empty = 0
         self._spinner_frame = 0
         self.chat_history.clear()
+        self.save_history()
         self.add_message("System", "Conversation cleared.")
+
+    def save_history(self):
+        """Save conversation messages and input history to disk.
+        
+        Strips base64 image data from user messages before saving
+        (stale after restart and would bloat the file).
+        """
+        try:
+            messages_to_save = []
+            for msg in self.messages:
+                msg_copy = dict(msg)
+                if msg_copy.get("role") == "user" and isinstance(msg_copy.get("content"), list):
+                    stripped_content = []
+                    for block in msg_copy["content"]:
+                        if isinstance(block, dict) and block.get("type") == "image_url":
+                            continue
+                        stripped_content.append(block)
+                    if not stripped_content:
+                        stripped_content = [{"type": "text", "text": "[image attached]"}]
+                    msg_copy["content"] = stripped_content
+                messages_to_save.append(msg_copy)
+            
+            data = {
+                "messages": messages_to_save,
+                "input_history": self._history
+            }
+            with open(HISTORY_PATH, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+            logger.info(f"History saved ({len(messages_to_save)} messages)")
+        except Exception as e:
+            log_exception(e, "save_history")
+
+    def load_history(self):
+        """Load conversation history from disk and reconstruct the chat UI.
+        
+        Replays user text and assistant text as "You"/"LLM" messages.
+        Summarizes tool-call chains as "System: [Previous session — N tool calls]".
+        """
+        if not os.path.exists(HISTORY_PATH):
+            logger.debug("No history file found, starting fresh")
+            return
+        
+        try:
+            with open(HISTORY_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            messages = data.get("messages", [])
+            input_history = data.get("input_history", [])
+            
+            if not messages:
+                logger.debug("History file is empty")
+                return
+            
+            self.messages = messages
+            self._history = input_history
+            sanitize_history(self.messages)
+            
+            tool_call_count = 0
+            for msg in messages:
+                role = msg.get("role", "")
+                if role == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        text = ""
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                text += block.get("text", "")
+                        if not text:
+                            text = "[image attached]"
+                    else:
+                        text = str(content)
+                    if text:
+                        self.add_message("You", text)
+                elif role == "assistant":
+                    if msg.get("tool_calls"):
+                        tool_call_count += len(msg.get("tool_calls"))
+                    content = msg.get("content", "")
+                    if content:
+                        if tool_call_count > 0:
+                            self.add_message("System", f"[Previous session — {tool_call_count} tool call{'s' if tool_call_count != 1 else ''}]")
+                            tool_call_count = 0
+                        self.add_message("LLM", content)
+            
+            if tool_call_count > 0:
+                self.add_message("System", f"[Previous session — {tool_call_count} tool call{'s' if tool_call_count != 1 else ''}]")
+            
+            truncate_messages(self.messages)
+            
+            logger.info(f"History loaded ({len(self.messages)} messages, {len(self._history)} input history entries)")
+            self.add_message("System", f"Previous session restored ({len(self.messages)} messages).")
+            
+        except Exception as e:
+            log_exception(e, "load_history")
+            self.add_message("System", "Could not load previous session history.")
 
     def _update_vision_ui(self):
         from .config import model_supports_vision
@@ -198,6 +296,7 @@ class LLMChatDocker(DockWidget):
         self._worker = None
         self.set_ready()
         self.add_message("System", "⚠ Aborted by user.")
+        self.save_history()
 
     def send_message(self):
         user_input = self.input_edit.text().strip()
@@ -237,6 +336,7 @@ class LLMChatDocker(DockWidget):
         sanitize_history(self.messages)
         self.messages.append(build_user_message(user_input, image_b64))
         self._tool_round = 0
+        self._consecutive_empty = 0
         self._spinner_frame = 0
         self._start_api_call()
 
@@ -246,7 +346,7 @@ class LLMChatDocker(DockWidget):
         else:
             self.set_busy("Waiting for LLM response...")
 
-        self._worker = ConversationWorker(self.messages, self.settings, parent=self)
+        self._worker = ConversationWorker(self.messages, self.settings, generate_tools(), parent=self)
         self._worker.response_ready.connect(self._on_response)
         self._worker.error_occurred.connect(self._on_error)
         self._worker.start()
@@ -305,8 +405,10 @@ class LLMChatDocker(DockWidget):
                 self.add_message("Error", event["message"])
 
         has_tool_calls = any(e["type"] in ("tool_start", "tool_result") for e in events)
+        has_content = any(e["type"] == "text" for e in events)
         if has_tool_calls:
             self._tool_round += 1
+            self._consecutive_empty = 0
             MAX_TOOL_ROUNDS = 30
             if self._tool_round >= MAX_TOOL_ROUNDS:
                 self.add_message("System", f"⚠ Stopped after {MAX_TOOL_ROUNDS} tool calls. Please try a simpler request or clear the conversation.")
@@ -318,8 +420,26 @@ class LLMChatDocker(DockWidget):
                 return
             self.set_busy(f"Step {self._tool_round}...")
             self._start_api_call()
+        elif not has_content:
+            self._consecutive_empty += 1
+            MAX_EMPTY = 2
+            if self._consecutive_empty <= MAX_EMPTY:
+                logger.info(f"Empty LLM response ({self._consecutive_empty}/{MAX_EMPTY}), retrying...")
+                self.add_message("System", f"LLM returned an empty response. Retrying ({self._consecutive_empty}/{MAX_EMPTY})...")
+                if self._abort_flag:
+                    self.set_ready()
+                    return
+                self._start_api_call()
+            else:
+                self._consecutive_empty = 0
+                self.add_message("Error", "LLM returned empty responses repeatedly. The model may be overloaded — try again later or clear the conversation.")
+                self._tool_round = 0
+                self.save_history()
+                self.set_ready()
         else:
             self._tool_round = 0
+            self._consecutive_empty = 0
+            self.save_history()
             self.set_ready()
 
     def _on_error(self, error_msg):
@@ -333,6 +453,7 @@ class LLMChatDocker(DockWidget):
         self._worker = None
         self.set_ready()
         self.add_message("Error", error_msg)
+        self.save_history()
 
     def _on_worker_timeout(self):
         self._countdown_timer.stop()
@@ -347,6 +468,7 @@ class LLMChatDocker(DockWidget):
         self._worker = None
         self.set_ready()
         self.add_message("Error", "Request timed out. The API may be temporarily unavailable.")
+        self.save_history()
 
     def add_message(self, sender, text):
         logger.debug(f"UI Message [{sender}]: {text[:100]}{'...' if len(text) > 100 else ''}")

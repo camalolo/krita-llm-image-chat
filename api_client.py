@@ -8,7 +8,7 @@ from .config import (
     API_URL, SYSTEM_PROMPT, RETRY_COUNT, TIMEOUT_SECONDS,
     DEFAULT_MODEL, logger, log_exception
 )
-from .tools import generate_tools, execute_tool
+from .tools import execute_tool
 
 
 class ConversationWorker(QThread):
@@ -21,17 +21,18 @@ class ConversationWorker(QThread):
     response_ready = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, messages, settings, parent=None):
+    def __init__(self, messages, settings, tools, parent=None):
         super().__init__(parent)
         self.messages = messages
         self.settings = settings
+        self.tools = tools
         self._abort_flag = False
 
     def abort(self):
         self._abort_flag = True
 
     def run(self):
-        response, error = _make_api_request(self.messages, self.settings, lambda: self._abort_flag)
+        response, error = _make_api_request(self.messages, self.settings, self.tools, lambda: self._abort_flag)
         if self._abort_flag:
             return
         if error:
@@ -77,9 +78,14 @@ def sanitize_history(messages):
         logger.info(f"Sanitized history: removed {stripped} incomplete messages")
 
 
-def _make_api_request(messages, settings, abort_check):
+def _make_api_request(messages, settings, tools, abort_check):
     """Make an API request to OpenRouter. Runs in worker thread.
     
+    Args:
+        messages: list of message dicts (user/assistant/tool)
+        settings: dict with 'api_key', 'model', 'temperature'
+        tools: pre-built tool schemas list (built on main thread)
+        abort_check: callable returning True if aborted
     Args:
         messages: list of message dicts (user/assistant/tool)
         settings: dict with 'api_key', 'model', 'temperature'
@@ -95,8 +101,6 @@ def _make_api_request(messages, settings, abort_check):
     model = settings.get('model', DEFAULT_MODEL)
     temperature = settings.get('temperature', 0.7)
     logger.info(f"[Worker] Starting API request: model={model}, temp={temperature}")
-
-    tools = generate_tools()
 
     payload = {
         "model": model,
