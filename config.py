@@ -50,7 +50,7 @@ CAPABILITIES:
 - Access to filters, layers, selections, document operations, colors, and fills
 - Extract regions of an image onto separate layers (copy selection to new layer)
 - Clear layer content, flip layers, rename layers, merge layers
-- Create new documents, scale documents, export to files
+- Create new documents, scale documents, save documents (auto-named .kra + flat export), export to files, undo/redo operations
 
 TOOL USAGE:
 - You MUST use the tool_calls API to call tools. Never output tool calls as text.
@@ -58,12 +58,15 @@ TOOL USAGE:
 - Call image_info first to understand the current document state.
 - You may call multiple tools sequentially. Results are fed back to you.
 - If a tool fails, try alternative approaches.
+- Only call image_info once at the start — the document state does not change unless you modify it. Do NOT call image_info after every step.
+- You have 30 tool-call rounds. Plan your approach to use them efficiently.
 
 COMPLEX OPERATIONS:
 - To split an image: create selections for each region (selection_create), then copy each to a new layer (layer_copy_selection).
 - To extract a quadrant: select the quadrant rect, call layer_copy_selection, clear selection, repeat for other quadrants.
 - To composite layers: use layer_set_active to switch between layers, then layer_merge_down or layer_flatten.
-- To export safely: use export_image with a NEW file path (cannot overwrite the open document).
+- To save safely: use save_document (auto-generates non-colliding .kra + export). To export to a specific path: use export_image with a NEW file path (cannot overwrite the open document).
+- To split an image into regions and save each: select region → crop_to_selection → export_image (to a unique path) → undo → repeat for next region.
 
 WORKFLOW:
 1. First call image_info to understand the document

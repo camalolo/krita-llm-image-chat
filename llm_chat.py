@@ -306,7 +306,7 @@ class LLMChatDocker(DockWidget):
         has_tool_calls = any(e["type"] in ("tool_start", "tool_result") for e in events)
         if has_tool_calls:
             self._tool_round += 1
-            MAX_TOOL_ROUNDS = 15
+            MAX_TOOL_ROUNDS = 30
             if self._tool_round >= MAX_TOOL_ROUNDS:
                 self.add_message("System", f"⚠ Stopped after {MAX_TOOL_ROUNDS} tool calls. Please try a simpler request or clear the conversation.")
                 self.set_ready()

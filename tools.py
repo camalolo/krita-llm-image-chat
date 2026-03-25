@@ -628,6 +628,30 @@ def handle_document_scale(args):
     return {"success": True, "message": f"Scaled document to {width}x{height}"}
 
 
+@register_handler("undo")
+def handle_undo(args):
+    krita = Krita.instance()
+    action = krita.action("edit_undo")
+    if not action:
+        return {"success": False, "error": "Undo action not available"}
+    if not action.isEnabled():
+        return {"success": False, "error": "Nothing to undo"}
+    action.trigger()
+    return {"success": True, "message": "Undo performed"}
+
+
+@register_handler("redo")
+def handle_redo(args):
+    krita = Krita.instance()
+    action = krita.action("edit_redo")
+    if not action:
+        return {"success": False, "error": "Redo action not available"}
+    if not action.isEnabled():
+        return {"success": False, "error": "Nothing to redo"}
+    action.trigger()
+    return {"success": True, "message": "Redo performed"}
+
+
 @register_handler("document_new")
 def handle_document_new(args):
     krita = Krita.instance()
@@ -644,6 +668,67 @@ def handle_document_new(args):
     if window:
         window.addView(doc)
     return {"success": True, "message": f"Created new document '{name}' ({width}x{height}, {resolution} PPI)", "data": {"width": width, "height": height, "name": name}}
+
+
+@register_handler("save_document")
+def handle_save_document(args):
+    doc = _get_document()
+    export_format = args.get("format", "png")
+    if export_format == "jpg":
+        export_format = "jpeg"
+    override_folder = args.get("folder")
+
+    # Determine save folder: user override > parent dir of current doc > Desktop
+    if override_folder:
+        folder = override_folder
+    elif doc.fileName():
+        folder = os.path.dirname(doc.fileName())
+        if not folder:
+            folder = os.path.join(os.path.expanduser("~"), "Desktop")
+    else:
+        folder = os.path.join(os.path.expanduser("~"), "Desktop")
+
+    os.makedirs(folder, exist_ok=True)
+
+    # Base name from document name, strip any existing extension
+    base_name = os.path.splitext(doc.name())[0]
+    if not base_name:
+        base_name = "Untitled"
+
+    current_path = doc.fileName() and os.path.normpath(doc.fileName()) or ""
+
+    # Find non-colliding filename
+    kra_path = None
+    export_path = None
+    for i in range(1000):
+        suffix = f"_{i:03d}" if i > 0 else ""
+        candidate_kra = os.path.join(folder, f"{base_name}{suffix}.kra")
+        candidate_export = os.path.join(folder, f"{base_name}{suffix}.{export_format}")
+        if (not os.path.exists(candidate_kra)
+                and not os.path.exists(candidate_export)
+                and os.path.normpath(candidate_kra) != current_path
+                and os.path.normpath(candidate_export) != current_path):
+            kra_path = candidate_kra
+            export_path = candidate_export
+            break
+
+    if not kra_path:
+        return {"success": False, "error": "Could not find a non-colliding filename after 1000 attempts"}
+
+    # Save as .kra
+    save_ok = doc.saveAs(kra_path)
+    if not save_ok:
+        return {"success": False, "error": f"Failed to save document to '{kra_path}'"}
+
+    # Export flat image
+    info = InfoObject()
+    if export_format == "jpeg":
+        info.setProperty("quality", 90)
+    export_ok = doc.exportImage(export_path, info)
+    if not export_ok:
+        return {"success": False, "error": f"Saved .kra to '{kra_path}' but failed to export to '{export_path}'"}
+
+    return {"success": True, "message": f"Saved document as '{kra_path}' and exported to '{export_path}'", "data": {"kra_path": kra_path, "export_path": export_path}}
 
 
 @register_handler("export_image")
@@ -1082,6 +1167,30 @@ def generate_tools():
         {
             "type": "function",
             "function": {
+                "name": "undo",
+                "description": "Undo the last operation. Use this to revert changes, e.g. after cropping a document to restore it before extracting the next region.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "redo",
+                "description": "Redo the last undone operation.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "document_new",
                 "description": "Create a new blank document and open it in the active window. The new document uses RGBA 8-bit color mode.",
                 "parameters": {
@@ -1093,6 +1202,21 @@ def generate_tools():
                         "resolution": {"type": "number", "description": "Resolution in PPI (default: 72)"}
                     },
                     "required": ["width", "height"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "save_document",
+                "description": "Save the current document with auto-generated filenames to avoid overwriting any existing files. Saves as .kra (Krita native, preserves layers) AND exports a flat PNG/JPEG. Never overwrites the currently open file or any existing file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "format": {"type": "string", "enum": ["png", "jpg"], "description": "Export format for the flat image (default: png)"},
+                        "folder": {"type": "string", "description": "Optional override for save folder. Defaults to same folder as the current document, or Desktop if untitled."}
+                    },
+                    "required": []
                 }
             }
         },
