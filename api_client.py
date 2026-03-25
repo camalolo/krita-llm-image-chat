@@ -54,11 +54,34 @@ def build_user_message(user_prompt, image_b64=None):
     return {"role": "user", "content": content}
 
 
+def sanitize_history(messages):
+    """Strip incomplete tool-call groups from the end of message history.
+
+    Call this before appending a new user message to history. If the previous
+    conversation turn ended with an unclosed tool chain (abort, error, model
+    switch), the trailing assistant(tool_calls) + tool result messages are
+    removed so providers don't reject the role ordering.
+    """
+    if not messages:
+        return
+    if messages[-1].get("role") != "tool":
+        return
+    stripped = 0
+    while messages and messages[-1].get("role") == "tool":
+        messages.pop()
+        stripped += 1
+    if messages and messages[-1].get("role") == "assistant" and "tool_calls" in messages[-1]:
+        messages.pop()
+        stripped += 1
+    if stripped:
+        logger.info(f"Sanitized history: removed {stripped} incomplete messages")
+
+
 def _make_api_request(messages, settings, abort_check):
     """Make an API request to OpenRouter. Runs in worker thread.
     
     Args:
-        messages: list of message dicts (user/assistant/tool) — READ ONLY
+        messages: list of message dicts (user/assistant/tool)
         settings: dict with 'api_key', 'model', 'temperature'
         abort_check: callable returning True if aborted
         

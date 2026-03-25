@@ -7,7 +7,7 @@ from PyQt5.QtCore import Qt, QEvent, QTimer
 from .config import DEFAULT_MODEL, TIMEOUT_SECONDS, RETRY_COUNT, SETTINGS_PATH, logger, log_exception, get_valid_model_id
 from .settings_dialog import SettingsDialog
 from .image_capture import get_current_image_base64
-from .api_client import ConversationWorker, build_user_message, process_response, truncate_messages
+from .api_client import ConversationWorker, build_user_message, process_response, truncate_messages, sanitize_history
 import json
 import os
 import time
@@ -234,6 +234,7 @@ class LLMChatDocker(DockWidget):
             self.set_ready()
             return
 
+        sanitize_history(self.messages)
         self.messages.append(build_user_message(user_input, image_b64))
         self._tool_round = 0
         self._spinner_frame = 0

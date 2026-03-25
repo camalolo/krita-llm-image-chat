@@ -77,6 +77,12 @@ WORKFLOW:
 Respond naturally. Use tools when you need to modify the image or gather information."""
 
 
+try:
+    with open(LOG_PATH, 'w'):
+        pass
+except OSError:
+    pass
+
 _handler = RotatingFileHandler(
     LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=2, encoding='utf-8'
 )
