@@ -387,12 +387,12 @@ def handle_document_crop(args):
         selection = doc.selection()
         if not selection:
             return {"success": False, "error": "No bounds specified and no selection exists"}
-    action = Krita.instance().action("crop_to_selection")
+    action = Krita.instance().action("resizeimagetoselection")
     if action:
         action.trigger()
         doc.refreshProjection()
         return {"success": True, "message": "Cropped document to selection"}
-    return {"success": False, "error": "Crop action not available"}
+    return {"success": False, "error": "Trim-to-selection action not available"}
 
 @register_handler("fill")
 def handle_fill(args):
@@ -752,6 +752,93 @@ def handle_save_document(args):
     return {"success": True, "message": f"Saved document as '{kra_path}' and exported to '{export_path}'", "data": {"kra_path": kra_path, "export_path": export_path}}
 
 
+@register_handler("split_export_regions")
+def handle_split_export_regions(args):
+    doc = _get_document()
+    regions = args.get("regions")
+    if not regions or not isinstance(regions, list):
+        return {"success": False, "error": "regions is required and must be a list of {x, y, w, h, path} objects"}
+    
+    current_path = doc.fileName() and os.path.normpath(doc.fileName()) or ""
+    results = []
+    
+    for i, region in enumerate(regions):
+        x = region.get("x")
+        y = region.get("y")
+        w = region.get("w")
+        h = region.get("h")
+        path = region.get("path")
+        
+        if x is None or y is None or w is None or h is None or not path:
+            results.append({"index": i, "success": False, "error": "Missing required field(s): x, y, w, h, path"})
+            continue
+        
+        # Infer format from extension (before collision check so we compare the final path)
+        _, ext = os.path.splitext(path)
+        if not ext:
+            path = f"{path}.png"
+            ext = ".png"
+        file_format = ext.lstrip('.').lower()
+        if file_format == "jpg":
+            file_format = "jpeg"
+        
+        # Safety: cannot overwrite the currently open document
+        if current_path and os.path.normpath(path) == current_path:
+            results.append({"index": i, "success": False, "path": path, "error": "Cannot overwrite the currently open document"})
+            continue
+        
+        # Step 1: Create selection
+        selection = Selection()
+        selection.select(int(x), int(y), int(w), int(h), 255)
+        doc.setSelection(selection)
+        
+        # Step 2: Crop to selection
+        crop_action = Krita.instance().action("resizeimagetoselection")
+        if not crop_action:
+            doc.setSelection(None)
+            results.append({"index": i, "success": False, "error": "Trim-to-selection action not available"})
+            continue
+        crop_action.trigger()
+        doc.refreshProjection()
+        
+        # Step 3: Export
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        info = InfoObject()
+        if file_format == "jpeg":
+            info.setProperty("quality", 90)
+        try:
+            export_ok = doc.exportImage(path, info)
+        except Exception as e:
+            export_ok = False
+            logger.error(f"Exception during export of region {i} to '{path}': {e}")
+        
+        # Step 4: Undo to restore original document (ALWAYS undo, even if export failed)
+        undo_action = Krita.instance().action("edit_undo")
+        if undo_action and undo_action.isEnabled():
+            undo_action.trigger()
+            doc.refreshProjection()
+        else:
+            logger.warning(f"Could not undo after region {i} export — document may be left in cropped state")
+        
+        # Step 5: Clear selection
+        doc.setSelection(None)
+        
+        if export_ok:
+            results.append({"index": i, "success": True, "path": path})
+            logger.info(f"Exported region {i} to '{path}'")
+        else:
+            results.append({"index": i, "success": False, "path": path, "error": f"Export to '{path}' failed"})
+    
+    success_count = sum(1 for r in results if r.get("success"))
+    fail_count = len(results) - success_count
+    if success_count == len(results):
+        return {"success": True, "message": f"Exported all {len(results)} regions successfully", "data": {"results": results}}
+    elif success_count > 0:
+        return {"success": True, "message": f"Exported {success_count}/{len(results)} regions ({fail_count} failed)", "data": {"results": results}}
+    else:
+        return {"success": False, "error": f"All {len(results)} regions failed to export", "data": {"results": results}}
+
+
 @register_handler("export_image")
 def handle_export_image(args):
     doc = _get_document()
@@ -759,14 +846,14 @@ def handle_export_image(args):
     file_format = args.get("format", "png")
     if not path:
         return {"success": False, "error": "path is required"}
-    current_path = doc.fileName()
-    if current_path and os.path.normpath(path) == os.path.normpath(current_path):
-        return {"success": False, "error": "Cannot overwrite the currently open document. Export to a different file path."}
     if file_format == "jpg":
         file_format = "jpeg"
     base, ext = os.path.splitext(path)
     if not ext:
         path = f"{path}.{file_format}"
+    current_path = doc.fileName()
+    if current_path and os.path.normpath(path) == os.path.normpath(current_path):
+        return {"success": False, "error": "Cannot overwrite the currently open document. Export to a different file path."}
     info = InfoObject()
     if file_format == "jpeg":
         info.setProperty("quality", 90)
@@ -1241,6 +1328,34 @@ def generate_tools():
                         "folder": {"type": "string", "description": "Optional override for save folder. Defaults to same folder as the current document, or Desktop if untitled."}
                     },
                     "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "split_export_regions",
+                "description": "Split the current document into rectangular regions and export each to a separate file. For each region: selects the area, crops, exports, then undoes to restore the original document. The document is left unchanged after all exports. Ideal for splitting images into quadrants, grids, or arbitrary sections.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "regions": {
+                            "type": "array",
+                            "description": "List of regions to extract and export",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "integer", "description": "Left edge X coordinate in pixels"},
+                                    "y": {"type": "integer", "description": "Top edge Y coordinate in pixels"},
+                                    "w": {"type": "integer", "description": "Width in pixels"},
+                                    "h": {"type": "integer", "description": "Height in pixels"},
+                                    "path": {"type": "string", "description": "File path to save to (extension determines format: .png or .jpg)"}
+                                },
+                                "required": ["x", "y", "w", "h", "path"]
+                            }
+                        }
+                    },
+                    "required": ["regions"]
                 }
             }
         },
