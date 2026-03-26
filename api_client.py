@@ -1,3 +1,4 @@
+import copy
 import json
 import time
 import urllib.request
@@ -5,7 +6,7 @@ import urllib.error
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from .config import (
-    API_URL, SYSTEM_PROMPT, RETRY_COUNT, TIMEOUT_SECONDS,
+    API_URL, OPENAI_DEFAULT_ENDPOINT, SYSTEM_PROMPT, RETRY_COUNT, TIMEOUT_SECONDS,
     DEFAULT_MODEL, logger, log_exception
 )
 from .tools import execute_tool
@@ -21,18 +22,19 @@ class ConversationWorker(QThread):
     response_ready = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, messages, settings, tools, parent=None):
+    def __init__(self, messages, settings, tools, parent=None, doc_info=None):
         super().__init__(parent)
         self.messages = messages
         self.settings = settings
         self.tools = tools
+        self.doc_info = doc_info
         self._abort_flag = False
 
     def abort(self):
         self._abort_flag = True
 
     def run(self):
-        response, error = _make_api_request(self.messages, self.settings, self.tools, lambda: self._abort_flag)
+        response, error = _make_api_request(self.messages, self.settings, self.tools, lambda: self._abort_flag, self.doc_info)
         if self._abort_flag:
             return
         if error:
@@ -78,49 +80,65 @@ def sanitize_history(messages):
         logger.info(f"Sanitized history: removed {stripped} incomplete messages")
 
 
-def _make_api_request(messages, settings, tools, abort_check):
-    """Make an API request to OpenRouter. Runs in worker thread.
+def _make_api_request(messages, settings, tools, abort_check, doc_info=None):
+    """Make an API request to the configured provider. Runs in worker thread.
     
     Args:
         messages: list of message dicts (user/assistant/tool)
-        settings: dict with 'api_key', 'model', 'temperature'
+        settings: dict with 'api_key', 'model', 'temperature', 'provider', 'endpoint' (for openai_compatible)
         tools: pre-built tool schemas list (built on main thread)
         abort_check: callable returning True if aborted
-    Args:
-        messages: list of message dicts (user/assistant/tool)
-        settings: dict with 'api_key', 'model', 'temperature'
-        abort_check: callable returning True if aborted
+        doc_info: optional dict of document info to inject into system message
         
     Returns:
         (response_dict | None, error_string | None)
     """
+    provider = settings.get('provider', 'openrouter')
     api_key = settings.get('api_key', '')
-    if not api_key:
+
+    if provider == 'openrouter' and not api_key:
         return None, "No API key configured. Open Settings to add your API key."
 
     model = settings.get('model', DEFAULT_MODEL)
     temperature = settings.get('temperature', 0.7)
-    logger.info(f"[Worker] Starting API request: model={model}, temp={temperature}")
+    logger.info(f"[Worker] Starting API request: provider={provider}, model={model}, temp={temperature}")
+
+    system_content = SYSTEM_PROMPT
+    if doc_info:
+        doc_info_str = json.dumps(doc_info, indent=2)
+        system_content += f"\n\nCurrent document info:\n```json\n{doc_info_str}\n```"
 
     payload = {
         "model": model,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+        "messages": [{"role": "system", "content": system_content}] + messages,
         "tools": tools,
         "tool_choice": "auto",
         "temperature": temperature,
         "max_tokens": 4096
     }
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-        "HTTP-Referer": "LLM Image Chat",
-        "X-Title": "LLM Image Chat"
-    }
+    # Build URL based on provider
+    if provider == 'openai_compatible':
+        endpoint = settings.get('endpoint', OPENAI_DEFAULT_ENDPOINT).rstrip('/')
+        if endpoint.endswith('/chat/completions'):
+            url = endpoint
+        else:
+            url = f"{endpoint}/chat/completions"
+    else:
+        url = API_URL
+
+    # Build headers based on provider
+    headers = {"Content-Type": "application/json"}
+    if provider == 'openrouter':
+        headers["Authorization"] = f"Bearer {api_key}"
+        headers["HTTP-Referer"] = "LLM Image Chat"
+        headers["X-Title"] = "LLM Image Chat"
+    elif api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     try:
         req = urllib.request.Request(
-            API_URL,
+            url,
             data=json.dumps(payload).encode('utf-8'),
             headers=headers,
             method='POST'
@@ -245,7 +263,15 @@ def process_response(response_data, messages, ui):
     if "tool_calls" in message:
         clean_tool_calls = []
         for tc in message["tool_calls"]:
-            clean_tc = {k: v for k, v in tc.items() if k != "index"}
+            clean_tc = copy.deepcopy(tc)
+            clean_tc.pop("index", None)
+            args_str = clean_tc.get("function", {}).get("arguments", "{}")
+            if isinstance(args_str, str):
+                try:
+                    json.loads(args_str)
+                except (json.JSONDecodeError, ValueError):
+                    logger.warning(f"Tool call arguments are not valid JSON, clearing arguments for history: {args_str[:200]}")
+                    clean_tc["function"]["arguments"] = "{}"
             clean_tool_calls.append(clean_tc)
         history_message["tool_calls"] = clean_tool_calls
     messages.append(history_message)
@@ -256,7 +282,8 @@ def process_response(response_data, messages, ui):
         events.append({"type": "text", "content": message["content"]})
 
     if "tool_calls" in message and message["tool_calls"]:
-        for tool_call in message["tool_calls"]:
+        num_tools = len(message["tool_calls"])
+        for i, tool_call in enumerate(message["tool_calls"]):
             if ui._abort_flag:
                 logger.info("Aborted before tool execution")
                 return None
@@ -272,12 +299,26 @@ def process_response(response_data, messages, ui):
                 args = json.loads(args_str)
                 logger.debug(f"Parsed arguments: {args}")
             except Exception as e:
-                logger.warning(f"Failed to parse tool arguments as JSON: {e}")
-                args = {}
+                logger.warning(f"Invalid JSON in tool arguments for {tool_name}: {e}")
+                error_detail = f"Invalid JSON arguments: {args_str[:100]}. {e}"
+                events.append({"type": "tool_start", "name": tool_name,
+                               "message": f"Skipped {tool_name} (invalid arguments)..."})
+                events.append({"type": "tool_result", "name": tool_name,
+                               "success": False, "message": error_detail})
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"success": False, "error": error_detail})
+                })
+                logger.debug(f"Added tool error result to message history (invalid JSON, not executed)")
+                continue
 
             events.append({"type": "tool_start", "name": tool_name,
                            "message": f"Calling {tool_name}..."})
-            ui.set_busy(f"Executing {tool_name}...")
+            if num_tools > 1:
+                ui.set_busy(f"Executing {tool_name} ({i+1}/{num_tools})...")
+            else:
+                ui.set_busy(f"Executing {tool_name}...")
 
             if ui._abort_flag:
                 return None

@@ -4,15 +4,43 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
                               QDialog)
 from PyQt5.QtCore import Qt, QEvent, QTimer
 
-from .config import DEFAULT_MODEL, TIMEOUT_SECONDS, RETRY_COUNT, SETTINGS_PATH, HISTORY_PATH, logger, log_exception, get_valid_model_id
+from .config import DEFAULT_MODEL, OPENAI_DEFAULT_ENDPOINT, TIMEOUT_SECONDS, RETRY_COUNT, SETTINGS_PATH, HISTORY_PATH, logger, log_exception, migrate_settings
 from .settings_dialog import SettingsDialog
 from .image_capture import get_current_image_base64
 from .api_client import ConversationWorker, build_user_message, process_response, truncate_messages, sanitize_history
-from .tools import generate_tools
+from .tools import generate_tools, classify_tools
 import json
 import os
 import time
 import html
+
+
+def _capture_doc_info():
+    """Capture current document info on the main thread for injection into system prompt."""
+    from krita import Krita
+    doc = Krita.instance().activeDocument()
+    if not doc:
+        return None
+    root = doc.rootNode()
+    layers = []
+    for node in root.childNodes():
+        layers.append({
+            "name": node.name(),
+            "type": node.type(),
+            "visible": node.visible(),
+            "opacity": int(node.opacity() * 100 / 255),
+            "blend_mode": node.blendingMode(),
+        })
+    active = doc.activeNode()
+    return {
+        "width": doc.width(),
+        "height": doc.height(),
+        "resolution": doc.resolution(),
+        "color_model": doc.colorModel(),
+        "color_depth": doc.colorDepth(),
+        "layers": layers,
+        "active_layer": active.name() if active else None,
+    }
 
 
 class LLMChatDocker(DockWidget):
@@ -28,6 +56,8 @@ class LLMChatDocker(DockWidget):
         self._history_index = -1
         self._draft_text = ""
         self._worker = None
+        self._tool_context = None
+        self._doc_info = None
         self._tool_round = 0
         self._countdown_timer = QTimer(self)
         self._countdown_timer.timeout.connect(self._update_countdown)
@@ -117,17 +147,37 @@ class LLMChatDocker(DockWidget):
         try:
             if os.path.exists(SETTINGS_PATH):
                 with open(SETTINGS_PATH, 'r') as f:
-                    self.settings = json.load(f)
-                self.settings['model'] = get_valid_model_id(self.settings.get('model', DEFAULT_MODEL))
-                logger.info(f"Settings loaded: model={self.settings.get('model')}, temp={self.settings.get('temperature')}")
+                    raw = json.load(f)
+
+                migrated = migrate_settings(raw)
+
+                if "provider" not in raw:
+                    os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+                    with open(SETTINGS_PATH, 'w') as f:
+                        json.dump(migrated, f, indent=2)
+                    logger.info("Settings migrated to new provider format and saved")
+
+                provider = migrated.get('provider', 'openrouter')
+                provider_cfg = migrated.get('providers', {}).get(provider, {})
+                self.settings = {
+                    'provider': provider,
+                    'api_key': provider_cfg.get('api_key', ''),
+                    'model': provider_cfg.get('model', DEFAULT_MODEL),
+                    'temperature': migrated.get('temperature', 0.7),
+                }
+                if provider == 'openai_compatible':
+                    self.settings['endpoint'] = provider_cfg.get('endpoint', OPENAI_DEFAULT_ENDPOINT)
+                    self.settings['has_vision'] = provider_cfg.get('has_vision', False)
+
+                logger.info(f"Settings loaded: provider={provider}, model={self.settings.get('model')}")
                 self._update_vision_ui()
             else:
-                self.settings = {'api_key': '', 'model': DEFAULT_MODEL, 'temperature': 0.7}
+                self.settings = {'provider': 'openrouter', 'api_key': '', 'model': DEFAULT_MODEL, 'temperature': 0.7}
                 logger.debug("No settings file, using defaults")
                 self._update_vision_ui()
         except Exception as e:
             log_exception(e, "LLMChatDocker.load_settings")
-            self.settings = {'api_key': '', 'model': DEFAULT_MODEL, 'temperature': 0.7}
+            self.settings = {'provider': 'openrouter', 'api_key': '', 'model': DEFAULT_MODEL, 'temperature': 0.7}
             self._update_vision_ui()
 
     def open_settings(self):
@@ -151,6 +201,8 @@ class LLMChatDocker(DockWidget):
         self._tool_round = 0
         self._consecutive_empty = 0
         self._spinner_frame = 0
+        self._tool_context = None
+        self._doc_info = None
         self.chat_history.clear()
         self.save_history()
         self.add_message("System", "Conversation cleared.")
@@ -252,7 +304,11 @@ class LLMChatDocker(DockWidget):
     def _update_vision_ui(self):
         from .config import model_supports_vision
         model_id = self.settings.get('model', DEFAULT_MODEL)
-        has_vision = model_supports_vision(model_id)
+        provider = self.settings.get('provider', 'openrouter')
+        if provider == 'openai_compatible':
+            has_vision = self.settings.get('has_vision', False)
+        else:
+            has_vision = model_supports_vision(model_id)
         if has_vision:
             self.include_image_cb.setEnabled(True)
             self.vision_note_label.setText("")
@@ -334,6 +390,10 @@ class LLMChatDocker(DockWidget):
             return
 
         sanitize_history(self.messages)
+        self._tool_context = classify_tools(user_input)
+        logger.debug(f"Classified tool context: {self._tool_context}")
+        self._doc_info = _capture_doc_info()
+        logger.debug(f"Captured doc_info: {self._doc_info is not None} ({len(self._doc_info) if self._doc_info else 0} keys)")
         self.messages.append(build_user_message(user_input, image_b64))
         self._tool_round = 0
         self._consecutive_empty = 0
@@ -346,7 +406,10 @@ class LLMChatDocker(DockWidget):
         else:
             self.set_busy("Waiting for LLM response...")
 
-        self._worker = ConversationWorker(self.messages, self.settings, generate_tools(), parent=self)
+        self._worker = ConversationWorker(
+            self.messages, self.settings, generate_tools(self._tool_context),
+            parent=self, doc_info=getattr(self, '_doc_info', None)
+        )
         self._worker.response_ready.connect(self._on_response)
         self._worker.error_occurred.connect(self._on_error)
         self._worker.start()
