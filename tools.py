@@ -1,5 +1,6 @@
 import json
 import os
+from collections import deque
 
 import numpy as np
 from krita import Krita, Selection, InfoObject
@@ -64,6 +65,81 @@ def _restore_selection(doc):
     doc.refreshProjection()
     logger.info("Restored selection from backup")
     return True
+
+
+def _magic_select(doc, x, y, tolerance, contiguous=False):
+    """Select pixels matching the color at (x, y) within tolerance.
+
+    Args:
+        doc: Active Krita document.
+        x, y: Seed point in document-space coordinates.
+        tolerance: Color distance threshold (0-255 Euclidean in RGB).
+        contiguous: If True, only select connected pixels (flood fill).
+    """
+    layer = doc.activeNode()
+    if layer is None:
+        return {"success": False, "error": "No active layer"}
+
+    arr, lx, ly, lw, lh = read_pixels(layer, doc)
+    if arr.size == 0:
+        return {"success": False, "error": "Layer has no pixel data"}
+
+    channels = get_channels(doc)
+    depth = doc.colorDepth().upper()
+
+    # Normalize to U8 if needed (U16/F16/F32 → scale to 0-255)
+    if depth == "U16":
+        raw = arr.reshape(lh, lw, -1).view(np.uint16).astype(np.float32)
+        u8 = (raw * (255.0 / 65535.0)).clip(0, 255).astype(np.uint8)
+        u8 = u8[:, :, :channels]
+    elif depth == "F16":
+        raw = arr.reshape(lh, lw, -1).view(np.float16).astype(np.float32)
+        u8 = (raw * 255.0).clip(0, 255).astype(np.uint8)
+        u8 = u8[:, :, :channels]
+    elif depth == "F32":
+        raw_float = arr.reshape(lh, lw, -1).view(np.float32)
+        u8 = (raw_float * 255.0).clip(0, 255).astype(np.uint8)
+        u8 = u8[:, :, :channels]
+    else:
+        u8 = arr[:, :, :channels]
+
+    # Clamp seed point to layer bounds
+    sx = max(0, min(x - lx, lw - 1))
+    sy = max(0, min(y - ly, lh - 1))
+
+    seed = u8[sy, sx].astype(np.float32)
+
+    # Vectorized Euclidean color distance (use only color channels, skip alpha)
+    n_color = min(3, channels)  # GRAY=1, GRAYA=1, RGB=3, RGBA=3, CMYK=4→3
+    rgb = u8[:, :, :n_color].astype(np.float32)
+    dist = np.sqrt(np.sum((rgb - seed[:n_color]) ** 2, axis=2))
+
+    tolerance = max(0, tolerance)
+    mask = dist <= tolerance
+
+    if contiguous:
+        # BFS flood fill on the mask from seed, only traversing True pixels
+        visited = np.zeros((lh, lw), dtype=bool)
+        visited[sy, sx] = True
+        queue = deque([(sy, sx)])
+        while queue:
+            cy, cx = queue.popleft()
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < lh and 0 <= nx < lw and not visited[ny, nx] and mask[ny, nx]:
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+        mask = visited
+
+    # Create Krita Selection from the boolean mask
+    sel = Selection()
+    sel.select(lx, ly, lw, lh, 255)
+    sel_bytes = (mask.astype(np.uint8) * 255).tobytes()
+    sel.setPixelData(sel_bytes, lx, ly, lw, lh)
+    doc.setSelection(sel)
+
+    pixel_count = int(mask.sum())
+    return {"success": True, "message": f"Selected {pixel_count} pixels"}
 
 
 def register_handler(name):
@@ -168,6 +244,14 @@ def handle_selection(args):
         doc.setSelection(selection)
         logger.info(f"Created {sel_type} selection: ({x},{y},{w},{h})")
         return {"success": True, "message": f"Created {sel_type} selection"}
+
+    elif action == "select_by_color":
+        _backup_selection(doc)
+        x = int(args.get("x", 0))
+        y = int(args.get("y", 0))
+        tolerance = int(args.get("tolerance", 32))
+        contiguous = args.get("contiguous", False)
+        return _magic_select(doc, x, y, tolerance, contiguous)
 
     elif action == "modify":
         _backup_selection(doc)
@@ -1584,7 +1668,8 @@ def generate_tools(context=None):
                 "name": "selection",
                 "description": (
                     "Manage selections. Actions: 'create' — make a new selection (type='rect' with x,y,w,h or type='all'); "
-                    "'modify' — alter existing selection (modify_action: invert, feather, grow, shrink, smooth; "
+                    "'select_by_color' — select pixels matching a color at (x,y) within tolerance (contiguous: "
+                    "only connected pixels); 'modify' — alter existing selection (modify_action: invert, feather, grow, shrink, smooth; "
                     "value sets the modifier amount); 'clear' — remove selection; 'info' — get selection bounds."
                 ),
                 "parameters": {
@@ -1592,7 +1677,7 @@ def generate_tools(context=None):
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["create", "modify", "clear", "info"],
+                            "enum": ["create", "select_by_color", "modify", "clear", "info"],
                             "description": "Selection action to perform",
                         },
                         "type": {
@@ -1604,6 +1689,16 @@ def generate_tools(context=None):
                         "y": {"type": "integer", "description": "Top edge of rectangle (pixels)", "minimum": 0},
                         "w": {"type": "integer", "description": "Width of rectangle (pixels)", "minimum": 0},
                         "h": {"type": "integer", "description": "Height of rectangle (pixels)", "minimum": 0},
+                        "tolerance": {
+                            "type": "integer",
+                            "description": "Color distance tolerance for select_by_color (0=exact match, 255=everything, default 32)",
+                            "minimum": 0,
+                            "maximum": 255,
+                        },
+                        "contiguous": {
+                            "type": "boolean",
+                            "description": "For select_by_color: if true, only select pixels connected to the seed point (flood fill). Default false.",
+                        },
                         "modify_action": {
                             "type": "string",
                             "enum": ["invert", "feather", "grow", "shrink", "smooth"],
