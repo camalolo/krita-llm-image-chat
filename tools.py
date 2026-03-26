@@ -22,7 +22,12 @@ BLEND_MODES = [
     "normal", "multiply", "screen", "overlay", "darken",
     "lighten", "color-dodge", "color-burn", "hard-light",
     "soft-light", "difference", "exclusion", "hue",
-    "saturation", "color", "luminosity", "erase",
+    "saturation", "color", "luminosity",     "erase",
+]
+
+SCHEMA_BLEND_MODES = [
+    "normal", "multiply", "screen", "overlay", "soft-light",
+    "difference", "color", "luminosity",
 ]
 
 TOOL_HANDLERS = {}
@@ -277,50 +282,41 @@ def handle_layer(args):
         logger.info(f"Active layer set to '{layer_name}'")
         return {"success": True, "message": f"Active layer set to '{layer_name}'"}
 
+    elif action == "set_properties":
+        layer_name = args.get("layer_name")
+        layer = _find_layer(doc, layer_name)
+        changed = []
+        prev_opacity = layer.opacity()
+        prev_blend_mode = layer.blendingMode()
+        prev_visible = layer.visible()
+
+        opacity = args.get("opacity")
+        if opacity is not None:
+            layer.setOpacity(int(opacity * 255 / 100))
+            changed.append(f"opacity={opacity}%")
+        blend_mode = args.get("blend_mode")
+        if blend_mode is not None:
+            krita_mode = _BLEND_MODE_MAP.get(blend_mode, blend_mode)
+            layer.setBlendingMode(krita_mode)
+            changed.append(f"blend_mode={blend_mode}")
+        visible = args.get("visible")
+        if visible is not None:
+            layer.setVisible(visible)
+            changed.append(f"visible={visible}")
+        if not changed:
+            return {"success": False, "error": "No properties specified. Provide opacity, blend_mode, or visible."}
+
+        global _last_property_backup
+        _last_property_backup = {
+            "layer_name": layer.name(),
+            "prev_opacity": prev_opacity,
+            "prev_blend_mode": prev_blend_mode,
+            "prev_visible": prev_visible,
+        }
+        doc.refreshProjection()
+        return {"success": True, "message": f"Updated '{layer.name()}': {', '.join(changed)}"}
+
     return {"success": False, "error": f"Unknown layer action: {action}"}
-
-
-# ── 4. layer_properties ─────────────────────────────────────────────────────────
-
-@register_handler("layer_properties")
-def handle_layer_properties(args):
-    global _last_property_backup
-    doc = _get_document()
-    layer = _find_layer(doc, args.get("layer_name"))
-    changed = []
-
-    prev_opacity = layer.opacity()
-    prev_blend_mode = layer.blendingMode()
-    prev_visible = layer.visible()
-
-    opacity = args.get("opacity")
-    if opacity is not None:
-        layer.setOpacity(int(opacity * 255 / 100))
-        changed.append(f"opacity={opacity}%")
-
-    blend_mode = args.get("blend_mode")
-    if blend_mode is not None:
-        krita_mode = _BLEND_MODE_MAP.get(blend_mode, blend_mode)
-        layer.setBlendingMode(krita_mode)
-        changed.append(f"blend_mode={blend_mode}")
-
-    visible = args.get("visible")
-    if visible is not None:
-        layer.setVisible(visible)
-        changed.append(f"visible={visible}")
-
-    if not changed:
-        return {"success": False, "error": "No properties specified. Provide opacity, blend_mode, or visible."}
-
-    _last_property_backup = {
-        "layer_name": layer.name(),
-        "prev_opacity": prev_opacity,
-        "prev_blend_mode": prev_blend_mode,
-        "prev_visible": prev_visible,
-    }
-    doc.refreshProjection()
-    logger.info(f"Updated '{layer.name()}': {', '.join(changed)}")
-    return {"success": True, "message": f"Updated '{layer.name()}': {', '.join(changed)}"}
 
 
 # ── 5. layer_stack ──────────────────────────────────────────────────────────────
@@ -555,6 +551,14 @@ _EFFECT_NAME_MAP = {
     "motion_blur": ["motion blur"],
     "wave": ["wave"],
     "desaturate": [],
+    "unsharp_mask": ["unsharp mask"],
+    "lens_blur": ["lens blur"],
+    "gaussian_high_pass": ["gaussian high pass"],
+    "height_to_normal": ["height to normal map"],
+    "auto_contrast": ["auto contrast"],
+    "mean_removal": ["mean removal"],
+    "color_transfer": ["color transfer"],
+    "gradient_map": ["gradient map"],
 }
 
 _EFFECT_INTENSITY_PROPS = {
@@ -572,6 +576,12 @@ _EFFECT_INTENSITY_PROPS = {
     "brightness_contrast": ["brightness", "contrast"],
     "hue_saturation": ["saturation", "hue"],
     "color_balance": ["strength", "contrast"],
+    "unsharp_mask": ["half-size", "amount", "strength"],
+    "lens_blur": ["radius", "brightness", "threshold"],
+    "gaussian_high_pass": ["radius", "strength"],
+    "height_to_normal": ["radius", "strength"],
+    "mean_removal": ["radius", "strength"],
+    "gradient_map": ["opacity", "strength"],
 }
 
 _effect_filter_map = None
@@ -1030,6 +1040,8 @@ def _read_active_for_art(args):
     if not layer:
         raise Exception("No active layer")
     arr, x, y, w, h = read_pixels(layer, doc)
+    if arr.size == 0:
+        return {"success": False, "error": f"Active layer '{layer.name()}' has no pixel data (empty bounds: {w}x{h}). Cannot perform operation."}
     return doc, layer, arr, x, y, w, h
 
 
@@ -1172,15 +1184,23 @@ _COLOR_GRADE_FUNCS = {
 
 @register_handler("color_grade")
 def handle_color_grade(args):
-    doc, layer, arr, x, y, w, h = _read_active_for_art(args)
+    result = _read_active_for_art(args)
+    if isinstance(result, dict):
+        return result
+    doc, layer, arr, x, y, w, h = result
     style = args.get("style", "warm")
-    intensity = args.get("intensity", 60)
-    new_name = args.get("layer_name", f"Color Grade {style}")
+    if "intensity" in args:
+        if not isinstance(args["intensity"], (int, float)):
+            return {"success": False, "error": f"'intensity' must be a number, got {type(args['intensity']).__name__}: {args['intensity']!r}"}
+        intensity = args["intensity"]
+    else:
+        intensity = 60
 
     grade_func = _COLOR_GRADE_FUNCS.get(style)
     if not grade_func:
         return {"success": False, "error": f"Unknown color grade style: {style}. Available: {list(_COLOR_GRADE_FUNCS.keys())}"}
 
+    new_name = args.get("layer_name", f"Color Grade {style}")
     blend = intensity / 100.0
     result = grade_func(arr, blend)
 
@@ -1337,7 +1357,10 @@ def handle_adjust(args):
 
 @register_handler("extract_subject")
 def handle_extract_subject(args):
-    doc, layer, arr, x, y, w, h = _read_active_for_art(args)
+    result = _read_active_for_art(args)
+    if isinstance(result, dict):
+        return result
+    doc, layer, arr, x, y, w, h = result
     target_hex = args.get("target_color")
     threshold = args.get("threshold", 30)
     softness = args.get("softness", 20)
@@ -1389,7 +1412,10 @@ def handle_extract_subject(args):
 
 @register_handler("apply_lut")
 def handle_apply_lut(args):
-    doc, layer, arr, x, y, w, h = _read_active_for_art(args)
+    result = _read_active_for_art(args)
+    if isinstance(result, dict):
+        return result
+    doc, layer, arr, x, y, w, h = result
     lut_json = args.get("lut")
     interpolation = args.get("interpolation", "smooth")
     new_name = args.get("layer_name", "LUT Applied")
@@ -1463,16 +1489,75 @@ def execute_tool(tool_name, args):
         log_exception(e, f"execute_tool({tool_name})")
         return {"success": False, "error": str(e)}
 
+# ── Tool categories for dynamic loading ──────────────────────────────────────────
+
+CORE_TOOLS = ["image_info", "undo", "redo"]
+CREATIVE_TOOLS = [
+    "color_grade", "procedural_texture", "adjust",
+    "extract_subject", "apply_lut", "apply_effect", "fill",
+]
+STRUCTURAL_TOOLS = [
+    "layer", "layer_stack", "transform", "selection",
+    "document", "export",
+]
+
+_CREATIVE_KEYWORDS = {
+    "color", "grade", "texture", "noise", "blur", "sharpen", "effect",
+    "filter", "warm", "cool", "vintage", "cinematic", "dramatic", "faded",
+    "bright", "contrast", "saturat", "hue", "temperature", "vibrance",
+    "gamma", "extract", "subject", "background", "adjust", "darken",
+    "lighten", "posterize", "threshold", "desaturat", "invert", "emboss",
+    "pixelat", "oil", "wave", "edge", "marble", "perlin", "voronoi",
+    "checker", "dots", "cloud", "wood", "lut", "gradient",
+}
+_STRUCTURAL_KEYWORDS = {
+    "layer", "group", "selection", "select", "crop", "resize", "scale",
+    "rotate", "flip", "transform", "export", "save", "document", "merge",
+    "flatten", "move", "duplicate", "delete", "rename", "new", "opacity",
+    "blend", "visible", "hide", "show",
+}
+
+
+def classify_tools(user_message):
+    """Classify user message to determine which tool subset to send.
+    
+    Returns:
+        "creative" — if only creative keywords found
+        "structural" — if only structural keywords found
+        None — if ambiguous or no keywords (sends all tools)
+    """
+    if not user_message:
+        return None
+    lower = user_message.lower()
+    has_creative = any(kw in lower for kw in _CREATIVE_KEYWORDS)
+    has_structural = any(kw in lower for kw in _STRUCTURAL_KEYWORDS)
+    if has_creative and not has_structural:
+        return "creative"
+    if has_structural and not has_creative:
+        return "structural"
+    return None
+
 
 # ── generate_tools ──────────────────────────────────────────────────────────────
 
 _cached_tools = None
+_cached_tools_creative = None
+_cached_tools_structural = None
 
 
-def generate_tools():
-    global _cached_tools
-    if _cached_tools is not None:
-        return _cached_tools
+def generate_tools(context=None):
+    if context == "creative":
+        global _cached_tools_creative
+        if _cached_tools_creative is not None:
+            return _cached_tools_creative
+    elif context == "structural":
+        global _cached_tools_structural
+        if _cached_tools_structural is not None:
+            return _cached_tools_structural
+    else:
+        global _cached_tools
+        if _cached_tools is not None:
+            return _cached_tools
 
     _anchor_options = [
         "center", "top-left", "top", "top-right",
@@ -1515,16 +1600,16 @@ def generate_tools():
                             "enum": ["all", "rect"],
                             "description": "Selection type for create action (default 'rect')",
                         },
-                        "x": {"type": "number", "description": "Left edge of rectangle (pixels)"},
-                        "y": {"type": "number", "description": "Top edge of rectangle (pixels)"},
-                        "w": {"type": "number", "description": "Width of rectangle (pixels)"},
-                        "h": {"type": "number", "description": "Height of rectangle (pixels)"},
+                        "x": {"type": "integer", "description": "Left edge of rectangle (pixels)", "minimum": 0},
+                        "y": {"type": "integer", "description": "Top edge of rectangle (pixels)", "minimum": 0},
+                        "w": {"type": "integer", "description": "Width of rectangle (pixels)", "minimum": 0},
+                        "h": {"type": "integer", "description": "Height of rectangle (pixels)", "minimum": 0},
                         "modify_action": {
                             "type": "string",
                             "enum": ["invert", "feather", "grow", "shrink", "smooth"],
                             "description": "Modification action for modify action",
                         },
-                        "value": {"type": "number", "description": "Modifier value for feather/grow/shrink"},
+                        "value": {"type": "number", "description": "Modifier value for feather/grow/shrink", "minimum": 0},
                     },
                     "required": ["action"],
                 },
@@ -1538,14 +1623,15 @@ def generate_tools():
                     "Layer management. Actions: 'create' — add a new layer (name, type, opacity, blend_mode); "
                     "'delete' — remove a layer; 'duplicate' — copy a layer; "
                     "'rename' — rename a layer (layer_name + new_name required); "
-                    "'set_active' — set the active layer."
+                    "'set_active' — set the active layer; "
+                    "'set_properties' — set opacity, blend_mode, and/or visibility on a layer."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["create", "delete", "duplicate", "rename", "set_active"],
+                            "enum": ["create", "delete", "duplicate", "rename", "set_active", "set_properties"],
                             "description": "Layer action to perform",
                         },
                         "name": {"type": "string", "description": "Layer name for create/rename"},
@@ -1554,36 +1640,17 @@ def generate_tools():
                             "enum": ["paint", "group", "vector"],
                             "description": "Layer type for create action (default 'paint')",
                         },
-                        "opacity": {"type": "number", "description": "Opacity 0-100 for create action"},
+                        "opacity": {"type": "number", "description": "Opacity 0-100 (for create and set_properties)", "minimum": 0, "maximum": 100},
                         "blend_mode": {
                             "type": "string",
-                            "enum": BLEND_MODES,
-                            "description": "Blend mode for create action",
+                            "enum": SCHEMA_BLEND_MODES,
+                            "description": "Blend mode (for create and set_properties). Also supports: darken, lighten, color-dodge, color-burn, hard-light, exclusion, hue, saturation, erase",
                         },
                         "layer_name": {"type": "string", "description": "Target layer name for delete/duplicate/rename/set_active"},
                         "new_name": {"type": "string", "description": "New name for duplicate/rename actions"},
+                        "visible": {"type": "boolean", "description": "Layer visibility (for set_properties action)"},
                     },
                     "required": ["action"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "layer_properties",
-                "description": (
-                    "Set properties on a layer. All parameters are optional; only the ones provided will be changed. "
-                    "Uses the active layer unless layer_name is specified."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "layer_name": {"type": "string", "description": "Target layer (defaults to active layer)"},
-                        "opacity": {"type": "number", "description": "Opacity 0-100"},
-                        "blend_mode": {"type": "string", "enum": BLEND_MODES, "description": "Blend mode"},
-                        "visible": {"type": "boolean", "description": "Layer visibility"},
-                    },
-                    "required": [],
                 },
             },
         },
@@ -1626,7 +1693,7 @@ def generate_tools():
                 "description": (
                     "Transform document or layer. Actions: 'resize' — change canvas size (width, height, anchor, scale_content); "
                     "'scale' — scale image to new dimensions; 'rotate' — rotate by degrees; "
-                    "'flip' — mirror horizontally or vertically. scope controls document vs layer (layer flip only)."
+                    "'flip' — mirror horizontally or vertically. scope: 'document' (default) for all actions. 'layer' only supported with flip action."
                 ),
                 "parameters": {
                     "type": "object",
@@ -1641,15 +1708,15 @@ def generate_tools():
                             "enum": ["document", "layer"],
                             "description": "Target scope (default 'document')",
                         },
-                        "width": {"type": "number", "description": "New width in pixels"},
-                        "height": {"type": "number", "description": "New height in pixels"},
+                        "width": {"type": "integer", "description": "New width in pixels", "minimum": 1},
+                        "height": {"type": "integer", "description": "New height in pixels", "minimum": 1},
                         "anchor": {
                             "type": "string",
                             "enum": _anchor_options,
                             "description": "Anchor point for resize (default 'center')",
                         },
                         "scale_content": {"type": "boolean", "description": "Scale existing content when resizing (default false)"},
-                        "degrees": {"type": "number", "description": "Rotation angle in degrees (-360 to 360)"},
+                        "degrees": {"type": "number", "description": "Rotation angle in degrees (-360 to 360)", "minimum": -360, "maximum": 360},
                         "direction": {
                             "type": "string",
                             "enum": ["horizontal", "vertical"],
@@ -1698,15 +1765,18 @@ def generate_tools():
                         "effect": {
                             "type": "string",
                             "enum": [
-                                "blur", "sharpen", "noise", "edge_detect", "emboss",
-                                "pixelate", "brightness_contrast", "hue_saturation",
-                                "color_balance", "invert", "posterize", "threshold",
-                                "oil_paint", "color_to_alpha", "gaussian_blur",
-                                "motion_blur", "wave", "desaturate",
+                                "auto_contrast", "blur", "brightness_contrast",
+                                "color_balance", "color_to_alpha", "color_transfer",
+                                "desaturate", "edge_detect", "emboss", "gaussian_blur",
+                                "gaussian_high_pass", "gradient_map", "height_to_normal",
+                                "hue_saturation", "invert", "lens_blur", "mean_removal",
+                                "motion_blur", "noise", "oil_paint", "pixelate",
+                                "posterize", "sharpen", "threshold", "unsharp_mask",
+                                "wave",
                             ],
                             "description": "Effect to apply",
                         },
-                        "intensity": {"type": "number", "description": "Effect strength 0-100 (default 50)"},
+                        "intensity": {"type": "number", "description": "Effect strength 0-100 (default 50)", "minimum": 0, "maximum": 100},
                         "target_color": {
                             "type": "string",
                             "description": "Hex color for color_to_alpha effect",
@@ -1751,10 +1821,10 @@ def generate_tools():
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "x": {"type": "number"},
-                                    "y": {"type": "number"},
-                                    "w": {"type": "number"},
-                                    "h": {"type": "number"},
+                                    "x": {"type": "integer", "minimum": 0},
+                                    "y": {"type": "integer", "minimum": 0},
+                                    "w": {"type": "integer", "minimum": 0},
+                                    "h": {"type": "integer", "minimum": 0},
                                     "path": {"type": "string"},
                                 },
                                 "required": ["x", "y", "w", "h", "path"],
@@ -1781,10 +1851,10 @@ def generate_tools():
                             "enum": ["new", "crop"],
                             "description": "Document action to perform",
                         },
-                        "width": {"type": "number", "description": "Width in pixels (for new, default 1920)"},
-                        "height": {"type": "number", "description": "Height in pixels (for new, default 1080)"},
+                        "width": {"type": "integer", "description": "Width in pixels (for new, default 1920)", "minimum": 1},
+                        "height": {"type": "integer", "description": "Height in pixels (for new, default 1080)", "minimum": 1},
                         "name": {"type": "string", "description": "Document name for new action"},
-                        "resolution": {"type": "number", "description": "Resolution in PPI for new action (default 72)"},
+                        "resolution": {"type": "number", "description": "Resolution in PPI for new action (default 72)", "minimum": 1},
                         "x": {"type": "number", "description": "Crop left edge (pixels)"},
                         "y": {"type": "number", "description": "Crop top edge (pixels)"},
                         "w": {"type": "number", "description": "Crop width (pixels)"},
@@ -1837,7 +1907,7 @@ def generate_tools():
                             ],
                             "description": "Color grading style",
                         },
-                        "intensity": {"type": "number", "description": "Grade intensity 0-100 (default 60)"},
+                        "intensity": {"type": "number", "description": "Grade intensity 0-100 (default 60)", "minimum": 0, "maximum": 100},
                         "layer_name": {"type": "string", "description": "Name for the new graded layer"},
                     },
                     "required": ["style"],
@@ -1865,10 +1935,10 @@ def generate_tools():
                         },
                         "color_1": {"type": "string", "description": "First hex color (default '#000000')"},
                         "color_2": {"type": "string", "description": "Second hex color (default '#FFFFFF')"},
-                        "scale": {"type": "number", "description": "Pattern scale (default 100)"},
-                        "intensity": {"type": "number", "description": "Opacity intensity 0-100 (default 80)"},
-                        "opacity": {"type": "number", "description": "Layer opacity 0-100 (default 100)"},
-                        "blend_mode": {"type": "string", "enum": BLEND_MODES, "description": "Blend mode (default 'normal')"},
+                        "scale": {"type": "number", "description": "Pattern scale (default 100)", "minimum": 1},
+                        "intensity": {"type": "number", "description": "Opacity intensity 0-100 (default 80)", "minimum": 0, "maximum": 100},
+                        "opacity": {"type": "number", "description": "Layer opacity 0-100 (default 100)", "minimum": 0, "maximum": 100},
+                        "blend_mode": {"type": "string", "enum": SCHEMA_BLEND_MODES, "description": "Blend mode (default 'normal'). Also supports: darken, lighten, color-dodge, color-burn, hard-light, exclusion, hue, saturation, erase"},
                         "layer_name": {"type": "string", "description": "Name for the new texture layer"},
                     },
                     "required": ["texture"],
@@ -1881,18 +1951,18 @@ def generate_tools():
                 "name": "adjust",
                 "description": (
                     "Apply image adjustments non-destructively. Creates a new layer with the adjusted result. "
-                    "At least one adjustment parameter is required."
+                    "Provide at least one adjustment parameter."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "brightness": {"type": "number", "description": "Brightness adjustment -100 to 100"},
-                        "contrast": {"type": "number", "description": "Contrast adjustment -100 to 100"},
-                        "saturation": {"type": "number", "description": "Saturation adjustment -100 to 100"},
-                        "hue_shift": {"type": "number", "description": "Hue rotation -180 to 180 degrees"},
-                        "temperature": {"type": "number", "description": "Color temperature -100 to 100"},
-                        "vibrance": {"type": "number", "description": "Vibrance adjustment -100 to 100"},
-                        "gamma": {"type": "number", "description": "Gamma correction 0.1 to 5.0"},
+                        "brightness": {"type": "number", "description": "Brightness adjustment -100 to 100", "minimum": -100, "maximum": 100},
+                        "contrast": {"type": "number", "description": "Contrast adjustment -100 to 100", "minimum": -100, "maximum": 100},
+                        "saturation": {"type": "number", "description": "Saturation adjustment -100 to 100", "minimum": -100, "maximum": 100},
+                        "hue_shift": {"type": "number", "description": "Hue rotation -180 to 180 degrees", "minimum": -180, "maximum": 180},
+                        "temperature": {"type": "number", "description": "Color temperature -100 to 100", "minimum": -100, "maximum": 100},
+                        "vibrance": {"type": "number", "description": "Vibrance adjustment -100 to 100", "minimum": -100, "maximum": 100},
+                        "gamma": {"type": "number", "description": "Gamma correction 0.1 to 5.0", "minimum": 0.1, "maximum": 5.0},
                         "layer_name": {"type": "string", "description": "Name for the new adjusted layer"},
                     },
                     "required": [],
@@ -1912,7 +1982,7 @@ def generate_tools():
                     "properties": {
                         "target_color": {"type": "string", "description": "Hex color to remove from the image"},
                         "threshold": {"type": "integer", "description": "Color distance threshold 0-255 (default 30)"},
-                        "softness": {"type": "number", "description": "Edge softness 0-100 (default 20)"},
+                        "softness": {"type": "number", "description": "Edge softness 0-100 (default 20)", "minimum": 0, "maximum": 100},
                         "layer_name": {"type": "string", "description": "Name for the new extracted layer"},
                     },
                     "required": [],
@@ -1948,4 +2018,17 @@ def generate_tools():
     ]
 
     _cached_tools = tools
+
+    creative_names = set(CORE_TOOLS + CREATIVE_TOOLS)
+    structural_names = set(CORE_TOOLS + STRUCTURAL_TOOLS)
+
+    _cached_tools_creative = [t for t in tools
+                              if t["function"]["name"] in creative_names]
+    _cached_tools_structural = [t for t in tools
+                                if t["function"]["name"] in structural_names]
+
+    if context == "creative":
+        return _cached_tools_creative
+    elif context == "structural":
+        return _cached_tools_structural
     return tools
