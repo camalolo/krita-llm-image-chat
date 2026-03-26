@@ -27,6 +27,39 @@ BLEND_MODES = [
 
 TOOL_HANDLERS = {}
 
+_last_property_backup = None
+_last_selection_backup = None
+
+
+def _backup_selection(doc):
+    global _last_selection_backup
+    sel = doc.selection()
+    if sel:
+        _last_selection_backup = {
+            "pixel_data": bytes(sel.pixelData(sel.x(), sel.y(), sel.width(), sel.height())),
+            "x": sel.x(),
+            "y": sel.y(),
+            "width": sel.width(),
+            "height": sel.height(),
+        }
+    else:
+        _last_selection_backup = None
+
+
+def _restore_selection(doc):
+    global _last_selection_backup
+    if _last_selection_backup is None:
+        return False
+    backup = _last_selection_backup
+    sel = Selection()
+    sel.select(backup["x"], backup["y"], backup["width"], backup["height"], 255)
+    sel.setPixelData(backup["pixel_data"], backup["x"], backup["y"], backup["width"], backup["height"])
+    doc.setSelection(sel)
+    _last_selection_backup = None
+    doc.refreshProjection()
+    logger.info("Restored selection from backup")
+    return True
+
 
 def register_handler(name):
     def decorator(func):
@@ -114,6 +147,7 @@ def handle_selection(args):
     action = args.get("action", "create")
 
     if action == "create":
+        _backup_selection(doc)
         sel_type = args.get("type", "rect")
         x = args.get("x", 0)
         y = args.get("y", 0)
@@ -131,6 +165,7 @@ def handle_selection(args):
         return {"success": True, "message": f"Created {sel_type} selection"}
 
     elif action == "modify":
+        _backup_selection(doc)
         modify_action = args.get("modify_action", "invert")
         value = args.get("value", 10)
         selection = doc.selection()
@@ -153,6 +188,7 @@ def handle_selection(args):
         return {"success": True, "message": f"Applied {modify_action} to selection"}
 
     elif action == "clear":
+        _backup_selection(doc)
         doc.setSelection(None)
         logger.info("Cleared selection")
         return {"success": True, "message": "Selection cleared"}
@@ -248,9 +284,14 @@ def handle_layer(args):
 
 @register_handler("layer_properties")
 def handle_layer_properties(args):
+    global _last_property_backup
     doc = _get_document()
     layer = _find_layer(doc, args.get("layer_name"))
     changed = []
+
+    prev_opacity = layer.opacity()
+    prev_blend_mode = layer.blendingMode()
+    prev_visible = layer.visible()
 
     opacity = args.get("opacity")
     if opacity is not None:
@@ -271,6 +312,12 @@ def handle_layer_properties(args):
     if not changed:
         return {"success": False, "error": "No properties specified. Provide opacity, blend_mode, or visible."}
 
+    _last_property_backup = {
+        "layer_name": layer.name(),
+        "prev_opacity": prev_opacity,
+        "prev_blend_mode": prev_blend_mode,
+        "prev_visible": prev_visible,
+    }
     doc.refreshProjection()
     logger.info(f"Updated '{layer.name()}': {', '.join(changed)}")
     return {"success": True, "message": f"Updated '{layer.name()}': {', '.join(changed)}"}
@@ -921,14 +968,32 @@ def handle_document(args):
 
 @register_handler("undo")
 def handle_undo(args):
+    global _last_property_backup
     doc = _get_document()
     layer = doc.activeNode()
+
     if layer:
         layer_name = layer.name()
         if restore_backup(layer_name, layer, doc):
             doc.refreshProjection()
             logger.info(f"Reverted filter on layer '{layer_name}' from backup")
             return {"success": True, "message": f"Reverted filter on layer '{layer_name}'"}
+
+    if _last_property_backup is not None:
+        backup = _last_property_backup
+        target = _find_layer_recursive(doc.rootNode(), backup["layer_name"])
+        if target:
+            target.setOpacity(backup["prev_opacity"])
+            target.setBlendingMode(backup["prev_blend_mode"])
+            target.setVisible(backup["prev_visible"])
+            _last_property_backup = None
+            doc.refreshProjection()
+            logger.info(f"Reverted property changes on '{backup['layer_name']}'")
+            return {"success": True, "message": f"Reverted property changes on '{backup['layer_name']}'"}
+
+    if _restore_selection(doc):
+        return {"success": True, "message": "Restored selection from backup"}
+
     krita = Krita.instance()
     action = krita.action("edit_undo")
     if not action:
