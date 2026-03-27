@@ -408,7 +408,8 @@ class LLMChatDocker(DockWidget):
 
         self._worker = ConversationWorker(
             self.messages, self.settings, generate_tools(self._tool_context),
-            parent=self, doc_info=getattr(self, '_doc_info', None)
+            parent=self, doc_info=getattr(self, '_doc_info', None),
+            user_context=self._tool_context
         )
         self._worker.response_ready.connect(self._on_response)
         self._worker.error_occurred.connect(self._on_error)

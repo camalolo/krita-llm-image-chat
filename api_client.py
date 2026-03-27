@@ -9,7 +9,7 @@ from .config import (
     API_URL, OPENAI_DEFAULT_ENDPOINT, SYSTEM_PROMPT, RETRY_COUNT, TIMEOUT_SECONDS,
     DEFAULT_MODEL, logger, log_exception
 )
-from .tools import execute_tool
+from .tools import execute_tool, generate_tools, classify_tools
 
 
 class ConversationWorker(QThread):
@@ -22,25 +22,74 @@ class ConversationWorker(QThread):
     response_ready = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, messages, settings, tools, parent=None, doc_info=None):
+    def __init__(self, messages, settings, tools, parent=None, doc_info=None, user_context=None):
         super().__init__(parent)
         self.messages = messages
         self.settings = settings
         self.tools = tools
         self.doc_info = doc_info
+        self.user_context = user_context
         self._abort_flag = False
 
     def abort(self):
         self._abort_flag = True
 
     def run(self):
-        response, error = _make_api_request(self.messages, self.settings, self.tools, lambda: self._abort_flag, self.doc_info)
+        response, error = _make_api_request(self.messages, self.settings, self.tools, lambda: self._abort_flag, self.doc_info, self.user_context)
         if self._abort_flag:
             return
         if error:
             self.error_occurred.emit(error)
         else:
             self.response_ready.emit(response)
+
+
+def _is_context_overflow(error_message):
+    """Check if an API error indicates context length overflow."""
+    overflow_patterns = ("n_keep", "n_ctx", "context length", "context_length",
+                         "token limit", "maximum context", "too many tokens",
+                         "input too long", "prompt too long")
+    lower = error_message.lower()
+    return any(p in lower for p in overflow_patterns)
+
+
+def _build_fallback_tools(messages, current_tools, user_context):
+    """Build a reduced tool set when context overflow occurs.
+    
+    Strategy:
+    1. If user_context is already 'creative' or 'structural', that subset was tried → fall back to CORE_TOOLS
+    2. If user_context is None, try classifying from last user message
+    3. If still None or CORE fallback, return only CORE_TOOLS
+    """
+    from .tools import CORE_TOOLS
+
+    core_names = set(CORE_TOOLS)
+
+    if user_context is not None:
+        # Already tried a subset, fall back to minimal (CORE only)
+        logger.info(f"[Worker] Context overflow with '{user_context}' tools, falling back to CORE_TOOLS only")
+        return [t for t in current_tools if t["function"]["name"] in core_names]
+    else:
+        # Try to classify from the last user message
+        last_user_msg = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    last_user_msg = " ".join(
+                        part.get("text", "") for part in content if part.get("type") == "text"
+                    )
+                else:
+                    last_user_msg = content
+                break
+
+        classified = classify_tools(last_user_msg)
+        if classified:
+            logger.info(f"[Worker] Context overflow, classified as '{classified}', retrying with subset")
+            return generate_tools(classified)
+        else:
+            logger.info("[Worker] Context overflow, no classification possible, falling back to CORE_TOOLS only")
+            return [t for t in current_tools if t["function"]["name"] in core_names]
 
 
 def build_user_message(user_prompt, image_b64=None):
@@ -80,7 +129,7 @@ def sanitize_history(messages):
         logger.info(f"Sanitized history: removed {stripped} incomplete messages")
 
 
-def _make_api_request(messages, settings, tools, abort_check, doc_info=None):
+def _make_api_request(messages, settings, tools, abort_check, doc_info=None, user_context=None):
     """Make an API request to the configured provider. Runs in worker thread.
     
     Args:
@@ -116,6 +165,8 @@ def _make_api_request(messages, settings, tools, abort_check, doc_info=None):
         "temperature": temperature,
         "max_tokens": 4096
     }
+
+    _ctx_retry_attempted = False
 
     # Build URL based on provider
     if provider == 'openai_compatible':
@@ -171,6 +222,25 @@ def _make_api_request(messages, settings, tools, abort_check, doc_info=None):
                 api_message = error_data.get("error", {}).get("message", error_body[:200])
             except Exception:
                 api_message = error_body[:200]
+
+            # Context overflow: retry with fewer tools
+            if code == 400 and _is_context_overflow(api_message) and not _ctx_retry_attempted:
+                _ctx_retry_attempted = True
+                logger.info("[Worker] Context overflow detected, retrying with fewer tools...")
+                reduced_tools = _build_fallback_tools(messages, tools, user_context)
+                if reduced_tools is not None and reduced_tools != tools:
+                    payload["tools"] = reduced_tools
+                    payload["messages"] = [{"role": "system", "content": system_content}] + messages
+                    req = urllib.request.Request(
+                        url,
+                        data=json.dumps(payload).encode('utf-8'),
+                        headers=headers,
+                        method='POST'
+                    )
+                    logger.info(f"[Worker] Retrying with {len(reduced_tools)} tool schemas")
+                    continue
+                else:
+                    return None, f"[HTTP 400] Model context too small for tool schemas. Try a model with a larger context window."
 
             if code >= 500 or code == 429:
                 if attempt < RETRY_COUNT - 1:
