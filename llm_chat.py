@@ -164,6 +164,7 @@ class LLMChatDocker(DockWidget):
                     'api_key': provider_cfg.get('api_key', ''),
                     'model': provider_cfg.get('model', DEFAULT_MODEL),
                     'temperature': migrated.get('temperature', 0.7),
+                    'image_max_size': migrated.get('image_max_size', 1024),
                 }
                 if provider == 'openai_compatible':
                     self.settings['endpoint'] = provider_cfg.get('endpoint', OPENAI_DEFAULT_ENDPOINT)
@@ -172,12 +173,12 @@ class LLMChatDocker(DockWidget):
                 logger.info(f"Settings loaded: provider={provider}, model={self.settings.get('model')}")
                 self._update_vision_ui()
             else:
-                self.settings = {'provider': 'openrouter', 'api_key': '', 'model': DEFAULT_MODEL, 'temperature': 0.7}
+                self.settings = {'provider': 'openrouter', 'api_key': '', 'model': DEFAULT_MODEL, 'temperature': 0.7, 'image_max_size': 1024}
                 logger.debug("No settings file, using defaults")
                 self._update_vision_ui()
         except Exception as e:
             log_exception(e, "LLMChatDocker.load_settings")
-            self.settings = {'provider': 'openrouter', 'api_key': '', 'model': DEFAULT_MODEL, 'temperature': 0.7}
+            self.settings = {'provider': 'openrouter', 'api_key': '', 'model': DEFAULT_MODEL, 'temperature': 0.7, 'image_max_size': 1024}
             self._update_vision_ui()
 
     def open_settings(self):
@@ -377,7 +378,7 @@ class LLMChatDocker(DockWidget):
         if self.include_image_cb.isChecked():
             logger.debug("Include image checkbox is checked, capturing image...")
             self.set_busy("Capturing image...")
-            image_b64 = get_current_image_base64()
+            image_b64 = get_current_image_base64(self.settings.get('image_max_size', 1024))
             if not image_b64:
                 logger.warning("Image capture failed, proceeding without image")
                 self.add_message("Warning", "Could not capture image. Proceeding without image.")

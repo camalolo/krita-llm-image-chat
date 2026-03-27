@@ -7,8 +7,8 @@ from .config import logger, log_exception
 import base64
 
 
-def get_current_image_base64():
-    """Capture the document composite as JPEG base64, resized to max 1024px."""
+def get_current_image_base64(max_size=1024):
+    """Capture the document composite as JPEG base64, resized to max max_size px. Set max_size=0 for original resolution."""
     logger.debug("get_current_image_base64() called")
     doc = Krita.instance().activeDocument()
     if not doc:
@@ -20,8 +20,6 @@ def get_current_image_base64():
     logger.debug(f"Document size: {w}x{h}, color model: {doc.colorModel()}, depth: {doc.colorDepth()}")
 
     try:
-        max_size = 1024
-
         # Export document to temp file to get composite of all visible layers
         fd, temp_path = tempfile.mkstemp(suffix=".png")
         os.close(fd)
@@ -48,7 +46,7 @@ def get_current_image_base64():
             logger.warning("Exported image is null or could not be loaded")
             return None
 
-        if w > max_size or h > max_size:
+        if max_size > 0 and (w > max_size or h > max_size):
             qimage = qimage.scaled(max_size, max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
         byte_array = QByteArray()

@@ -108,6 +108,16 @@ class SettingsDialog(QDialog):
         temp_layout.addWidget(self.temperature_label)
         form_layout.addRow("Temperature:", temp_layout)
 
+        # --- Shared: Image Max Size ---
+        self.image_max_size_combo = QComboBox()
+        self.image_max_size_combo.addItem("512px — Budget / Fast", 512)
+        self.image_max_size_combo.addItem("768px — Balanced", 768)
+        self.image_max_size_combo.addItem("1024px — Standard (default)", 1024)
+        self.image_max_size_combo.addItem("1568px — High Detail", 1568)
+        self.image_max_size_combo.addItem("Original (no resize)", 0)
+        self.image_max_size_combo.setCurrentIndex(2)
+        form_layout.addRow("Image Max Size:", self.image_max_size_combo)
+
         layout.addLayout(form_layout)
 
         # --- Buttons ---
@@ -284,6 +294,12 @@ class SettingsDialog(QDialog):
                 temp = int(settings.get('temperature', 0.7) * 10)
                 self.temperature_slider.setValue(temp)
 
+                image_max_size = settings.get('image_max_size', 1024)
+                for i in range(self.image_max_size_combo.count()):
+                    if self.image_max_size_combo.itemData(i) == image_max_size:
+                        self.image_max_size_combo.setCurrentIndex(i)
+                        break
+
                 # Load the active provider's fields into UI
                 self._load_provider_fields(provider)
 
@@ -305,6 +321,7 @@ class SettingsDialog(QDialog):
         settings = {
             'provider': provider,
             'temperature': self.temperature_slider.value() / 10,
+            'image_max_size': self.image_max_size_combo.currentData(),
             'providers': dict(self._provider_configs),
         }
         # Ensure all providers have a dict entry
@@ -332,6 +349,7 @@ class SettingsDialog(QDialog):
             'api_key': cfg.get('api_key', ''),
             'model': cfg.get('model', DEFAULT_MODEL),
             'temperature': self.temperature_slider.value() / 10,
+            'image_max_size': self.image_max_size_combo.currentData(),
         }
         if provider == 'openai_compatible':
             result['endpoint'] = cfg.get('endpoint', OPENAI_DEFAULT_ENDPOINT)
