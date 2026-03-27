@@ -401,6 +401,7 @@ def process_response(response_data, messages, ui):
                 result = {"success": False, "error": str(e)}
 
             if result.get("success"):
+                ui._doc_dirty = True
                 msg = result.get("message", "Done")
                 events.append({"type": "tool_result", "name": tool_name,
                                "success": True, "message": msg})

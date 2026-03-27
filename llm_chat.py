@@ -59,6 +59,7 @@ class LLMChatDocker(DockWidget):
         self._tool_context = None
         self._doc_info = None
         self._tool_round = 0
+        self._doc_dirty = True
         self._countdown_timer = QTimer(self)
         self._countdown_timer.timeout.connect(self._update_countdown)
         self._countdown_start = 0
@@ -204,6 +205,7 @@ class LLMChatDocker(DockWidget):
         self._spinner_frame = 0
         self._tool_context = None
         self._doc_info = None
+        self._doc_dirty = True
         self.chat_history.clear()
         self.save_history()
         self.add_message("System", "Conversation cleared.")
@@ -375,13 +377,16 @@ class LLMChatDocker(DockWidget):
         self.set_busy("Thinking...")
 
         image_b64 = None
-        if self.include_image_cb.isChecked():
-            logger.debug("Include image checkbox is checked, capturing image...")
+        if self.include_image_cb.isChecked() and self._doc_dirty:
+            logger.debug("Document is dirty, capturing image...")
+            self._doc_dirty = False
             self.set_busy("Capturing image...")
             image_b64 = get_current_image_base64(self.settings.get('image_max_size', 1024))
             if not image_b64:
                 logger.warning("Image capture failed, proceeding without image")
                 self.add_message("Warning", "Could not capture image. Proceeding without image.")
+        elif self.include_image_cb.isChecked():
+            logger.debug("Include image checked but document unchanged, skipping capture")
         else:
             logger.debug("Include image checkbox is not checked")
 
@@ -483,6 +488,12 @@ class LLMChatDocker(DockWidget):
             if self._abort_flag:
                 self.set_ready()
                 return
+            if self.include_image_cb.isChecked() and self._doc_dirty:
+                logger.debug("Tool modified document, re-capturing image for next round...")
+                self._doc_dirty = False
+                updated_image = get_current_image_base64(self.settings.get('image_max_size', 1024))
+                if updated_image:
+                    self.messages.append(build_user_message(None, updated_image))
             self.set_busy(f"Step {self._tool_round}...")
             self._start_api_call()
         elif not has_content:
@@ -555,4 +566,4 @@ class LLMChatDocker(DockWidget):
         scrollbar.setValue(scrollbar.maximum())
 
     def canvasChanged(self, canvas):
-        pass
+        self._doc_dirty = True

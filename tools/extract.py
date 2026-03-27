@@ -1,17 +1,20 @@
-"""Extract subject tool: remove background color non-destructively."""
+"""Remove background color tool: chroma-key style color removal, non-destructive."""
 
 import numpy as np
 from ._registry import register_handler, TOOL_SCHEMAS, _read_active_for_art
 from ..pixel_ops import hex_to_rgba, color_distance, create_blank_layer, write_pixels
 from ..config import logger
 
-TOOL_SCHEMAS["extract_subject"] = {
+TOOL_SCHEMAS["remove_bg_color"] = {
     "type": "function",
     "function": {
-        "name": "extract_subject",
+        "name": "remove_bg_color",
         "description": (
-            "Extract a subject by removing a background color. Non-destructive (creates new layer). "
-            "When target_color is omitted, auto-detects the background from image corners."
+            "Remove a solid background color (chroma key). Only works for uniform/flat backgrounds "
+            "(green screen, white backdrop, solid color). Does NOT detect or isolate subjects — "
+            "it simply makes pixels matching the target color transparent. For natural/complex "
+            "backgrounds this tool will not produce good results. Non-destructive (creates new layer). "
+            "When target_color is omitted, auto-detects from image corners."
         ),
         "parameters": {
             "type": "object",
@@ -27,8 +30,8 @@ TOOL_SCHEMAS["extract_subject"] = {
 }
 
 
-@register_handler("extract_subject")
-def handle_extract_subject(args):
+@register_handler("remove_bg_color")
+def handle_remove_bg_color(args):
     result = _read_active_for_art(args)
     if isinstance(result, dict):
         return result
@@ -36,7 +39,7 @@ def handle_extract_subject(args):
     target_hex = args.get("target_color")
     threshold = args.get("threshold", 30)
     softness = args.get("softness", 20)
-    new_name = args.get("layer_name", "Extracted Subject")
+    new_name = args.get("layer_name", "Removed BG")
 
     if target_hex:
         tr, tg, tb, _ = hex_to_rgba(target_hex)
@@ -75,6 +78,6 @@ def handle_extract_subject(args):
     write_pixels(new_layer, result, x, y, w, h, doc)
     doc.setActiveNode(new_layer)
     doc.refreshProjection()
-    logger.info(f"Extracted subject (threshold={threshold}, softness={softness})")
-    return {"success": True, "message": f"Extracted subject to layer '{new_name}'",
+    logger.info(f"Removed bg color (threshold={threshold}, softness={softness})")
+    return {"success": True, "message": f"Removed background color to layer '{new_name}'",
             "data": {"layer_name": new_name}}

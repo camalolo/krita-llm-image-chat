@@ -6,10 +6,10 @@ generate_tools() builds the OpenAI-format tool schema list from TOOL_SCHEMAS reg
 
 from ._registry import TOOL_SCHEMAS
 
-CORE_TOOLS = ["image_info", "undo", "redo"]
+CORE_TOOLS = ["image_info", "pick_color", "undo", "redo"]
 CREATIVE_TOOLS = [
     "color_grade", "procedural_texture", "adjust",
-    "extract_subject", "apply_lut", "apply_effect", "fill",
+    "remove_bg_color", "remove_background", "apply_lut", "apply_effect", "fill",
 ]
 STRUCTURAL_TOOLS = [
     "layer", "layer_stack", "transform", "selection",
@@ -24,6 +24,7 @@ _CREATIVE_KEYWORDS = {
     "lighten", "posterize", "threshold", "desaturat", "invert", "emboss",
     "pixelat", "oil", "wave", "edge", "marble", "perlin", "voronoi",
     "checker", "dots", "cloud", "wood", "lut", "gradient",
+    "pick", "sample", "erase_background",
 }
 _STRUCTURAL_KEYWORDS = {
     "layer", "group", "selection", "select", "crop", "resize", "scale",
